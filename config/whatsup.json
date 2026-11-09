@@ -1,0 +1,58 @@
+{
+  "title": "WhatsUp",
+  "refresh_ms": 2000,
+  "open": "tab",
+  "browser_app": "Google Chrome",
+  "groups": [
+    {
+      "id": "web-stacks",
+      "label": "Web App Stacks",
+      "columns": ["Directory", "Workspace", "Frontend", "Admin", "API Docs"],
+      "rows": [
+        {
+          "tone": "gray",
+          "cells": [
+            "~/workspace/myapp",
+            "dev",
+            { "label": "frontend", "url": "http://localhost:3000", "port": 3000 },
+            { "label": "admin", "url": "http://localhost:8000/admin/", "port": 8000 },
+            { "label": "api docs", "url": "http://localhost:8000/docs/", "port": 8000 }
+          ]
+        },
+        {
+          "tone": "black",
+          "cells": [
+            "~/workspace/myapp2",
+            "dev2",
+            { "label": "frontend2", "url": "http://localhost:3002", "port": 3002 },
+            { "label": "admin2", "url": "http://localhost:8002/admin/", "port": 8002 },
+            null
+          ]
+        }
+      ]
+    },
+    {
+      "id": "personal",
+      "label": "Personal Projects",
+      "columns": ["Project", "Directory", "Site"],
+      "rows": [
+        {
+          "tone": "gray",
+          "cells": [
+            "Blog",
+            "~/workspace/blog",
+            { "label": "blog", "url": "http://localhost:1313/" }
+          ]
+        },
+        {
+          "tone": "black",
+          "cells": [
+            "Vite Playground",
+            "~/workspace/playground",
+            { "label": "playground", "url": "http://localhost:5173/", "port": 5173 }
+          ]
+        }
+      ]
+    }
+  ]
+}

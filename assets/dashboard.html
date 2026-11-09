@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WhatsUp</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #1b1f24;
+      --header: #24292f;
+      --line: #3a414b;
+      --text: #e8eaed;
+      --muted: #9aa3ad;
+      --link: #7eb0ff;
+      --link-hover: #b7d0ff;
+      --up: #3dd68c;
+      --down: #f07178;
+      --gray: #2a3038;
+      --black: #101114;
+      --gray-all-up: #1d4a33;
+      --black-all-up: #143524;
+      --chip: #15181d;
+      --focus: #ffd166;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    header {
+      background: var(--header);
+      border-bottom: 1px solid var(--line);
+      padding: 22px 28px 0;
+    }
+
+    .title-row {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 32px;
+      font-weight: 650;
+      letter-spacing: -0.03em;
+    }
+
+    .summary {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding-bottom: 10px;
+    }
+
+    label.toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    button.quit, button.text-button {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 6px 12px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button.quit:hover, button.text-button:hover { border-color: var(--muted); }
+
+    nav.tabs {
+      display: flex;
+      gap: 22px;
+      margin-top: 18px;
+    }
+
+    nav.tabs button {
+      background: none;
+      border: 0;
+      border-bottom: 2px solid transparent;
+      color: var(--link);
+      font: inherit;
+      padding: 8px 0 10px;
+      cursor: pointer;
+    }
+
+    nav.tabs button[aria-selected="true"] {
+      border-bottom-color: var(--link);
+      font-weight: 600;
+    }
+
+    .panel h2 {
+      margin: 22px 0 8px;
+      font-size: 15px;
+      font-weight: 650;
+      letter-spacing: 0.01em;
+    }
+
+    .panel h2:first-child { margin-top: 0; }
+
+    main { padding: 22px 28px 40px; }
+
+    .banner {
+      display: none;
+      margin-bottom: 14px;
+      padding: 10px 12px;
+      border: 1px solid var(--down);
+      border-radius: 8px;
+      color: #ffd5d8;
+    }
+
+    .banner.show { display: block; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border: 1px solid #000;
+    }
+
+    th {
+      text-align: left;
+      font-weight: 650;
+      padding: 12px 14px;
+      background: #2c323a;
+      border-bottom: 1px solid var(--line);
+    }
+
+    td {
+      padding: 11px 14px;
+      vertical-align: middle;
+      border-top: 1px solid rgba(255, 255, 255, 0.04);
+    }
+
+    tr.gray td { background: var(--gray); }
+    tr.black td { background: var(--black); }
+    tr.gray.all-up td { background: var(--gray-all-up); }
+    tr.black.all-up td { background: var(--black-all-up); }
+    tr.hidden { display: none; }
+
+    .service {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 0;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      font: inherit;
+      text-align: left;
+    }
+
+    .service.up { cursor: pointer; color: var(--link); }
+    .service.up:hover .name { color: var(--link-hover); text-decoration: underline; }
+    .service:disabled { cursor: default; color: var(--muted); }
+
+    .dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      flex: 0 0 auto;
+      background: var(--down);
+      box-shadow: 0 0 0 3px rgba(240, 113, 120, 0.12);
+    }
+
+    .service.up .dot {
+      background: var(--up);
+      box-shadow: 0 0 0 3px rgba(61, 214, 140, 0.14);
+    }
+
+    .copy { display: flex; flex-direction: column; min-width: 0; }
+    .name { font-weight: 550; }
+    .port {
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .service:focus-visible, button:focus-visible, input:focus-visible {
+      outline: 2px solid var(--focus);
+      outline-offset: 2px;
+    }
+
+    footer {
+      margin-top: 16px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    footer code {
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="title-row">
+      <div>
+        <h1 id="title">WhatsUp</h1>
+        <p class="summary" id="summary">Checking local ports…</p>
+      </div>
+      <div class="actions">
+        <label class="toggle">
+          <input id="up-only" type="checkbox">
+          Up only
+        </label>
+        <button class="quit" id="quit" type="button">Quit</button>
+      </div>
+    </div>
+    <nav class="tabs" id="tabs" aria-label="Groups"></nav>
+  </header>
+  <main>
+    <div class="banner" id="banner" role="status"></div>
+    <div id="tables"></div>
+    <footer id="footer"></footer>
+  </main>
+  <script>
+    const tabsEl = document.getElementById("tabs");
+    const tablesEl = document.getElementById("tables");
+    const summaryEl = document.getElementById("summary");
+    const titleEl = document.getElementById("title");
+    const bannerEl = document.getElementById("banner");
+    const footerEl = document.getElementById("footer");
+    const upOnlyEl = document.getElementById("up-only");
+    const quitEl = document.getElementById("quit");
+
+    const requestedGroup = new URLSearchParams(location.search).get("group");
+    let activeGroup = requestedGroup || sessionStorage.getItem("whatsup-tab") || "";
+    let timer = 0;
+    let lastView = "";
+    upOnlyEl.checked = localStorage.getItem("whatsup-up-only") === "1";
+
+    upOnlyEl.addEventListener("change", () => {
+      localStorage.setItem("whatsup-up-only", upOnlyEl.checked ? "1" : "0");
+      const buttons = document.querySelectorAll("#tables tbody tr");
+      buttons.forEach(applyUpOnly);
+    });
+
+    quitEl.addEventListener("click", async () => {
+      quitEl.disabled = true;
+      clearTimeout(timer);
+      await fetch("/api/quit", { method: "POST" });
+      banner("WhatsUp stopped. You can close this tab.");
+      summaryEl.textContent = "Stopped";
+    });
+
+    function banner(text) {
+      bannerEl.textContent = text;
+      bannerEl.classList.toggle("show", Boolean(text));
+    }
+
+    function applyGroupVisibility() {
+      document.querySelectorAll("#tabs button").forEach((button) => {
+        button.setAttribute("aria-selected", button.dataset.group === activeGroup ? "true" : "false");
+      });
+      document.querySelectorAll("#tables > .panel").forEach((panel) => {
+        panel.hidden = panel.dataset.group !== activeGroup;
+      });
+    }
+
+    function applyUpOnly(row) {
+      const links = [...row.querySelectorAll(".service")];
+      const anyUp = links.some((link) => link.classList.contains("up"));
+      const hide = upOnlyEl.checked && links.length > 0 && !anyUp;
+      row.classList.toggle("hidden", hide);
+    }
+
+    function viewKey(data) {
+      const copy = Object.assign({}, data);
+      delete copy.checked_at_ms;
+      return JSON.stringify(copy);
+    }
+
+    function paintSummary(data) {
+      const when = new Date(data.checked_at_ms);
+      const clock = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
+      summaryEl.textContent = data.ports_up + " of " + data.ports_total + " ports listening · " + clock;
+    }
+
+    function render(data) {
+      document.title = data.title || "WhatsUp";
+      titleEl.textContent = data.title || "WhatsUp";
+      paintSummary(data);
+      banner(data.config_error || "");
+      const nextView = viewKey(data);
+      if (nextView === lastView) return;
+      lastView = nextView;
+
+      const ids = ["all", ...data.groups.map((group) => group.id)];
+      if (!ids.includes(activeGroup)) activeGroup = "all";
+
+      tabsEl.replaceChildren();
+      [{ id: "all", label: "All" }, ...data.groups].forEach((group) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.group = group.id;
+        button.textContent = group.label;
+        button.addEventListener("click", () => {
+          activeGroup = group.id;
+          sessionStorage.setItem("whatsup-tab", activeGroup);
+          applyGroupVisibility();
+        });
+        tabsEl.appendChild(button);
+      });
+
+      tablesEl.replaceChildren();
+      const allPanel = document.createElement("div");
+      allPanel.className = "panel";
+      allPanel.dataset.group = "all";
+      data.groups.forEach((group) => {
+        const heading = document.createElement("h2");
+        heading.textContent = group.label;
+        allPanel.append(heading, buildTable(group));
+      });
+      tablesEl.appendChild(allPanel);
+      data.groups.forEach((group) => {
+        const panel = document.createElement("div");
+        panel.className = "panel";
+        panel.dataset.group = group.id;
+        panel.appendChild(buildTable(group));
+        tablesEl.appendChild(panel);
+      });
+      applyGroupVisibility();
+
+      footerEl.replaceChildren();
+      footerEl.append("A port is up when something accepts TCP on 127.0.0.1 or ::1. Config: ");
+      const code = document.createElement("code");
+      code.textContent = data.config_path;
+      footerEl.append(code);
+    }
+
+    function buildTable(group) {
+      const table = document.createElement("table");
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      group.columns.forEach((column) => {
+        const th = document.createElement("th");
+        th.scope = "col";
+        th.textContent = column;
+        headRow.appendChild(th);
+      });
+      head.appendChild(headRow);
+      table.appendChild(head);
+
+      const body = document.createElement("tbody");
+      sections(group.rows).forEach((section) => {
+        const services = section.flatMap((row) => row.cells.filter((cell) => cell && cell.type === "link"));
+        const allUp = services.length > 0 && services.every((cell) => cell.up);
+        section.forEach((row) => {
+          const tr = document.createElement("tr");
+          tr.className = row.tone === "black" ? "black" : "gray";
+          tr.classList.toggle("all-up", allUp);
+          row.cells.forEach((cell) => tr.appendChild(renderCell(cell)));
+          applyUpOnly(tr);
+          body.appendChild(tr);
+        });
+      });
+      table.appendChild(body);
+      return table;
+    }
+
+    // A section is a run of consecutive rows sharing the same tone band.
+    function sections(rows) {
+      const result = [];
+      rows.forEach((row, index) => {
+        if (index === 0 || row.tone !== rows[index - 1].tone) result.push([]);
+        result[result.length - 1].push(row);
+      });
+      return result;
+    }
+
+    function renderCell(cell) {
+      const td = document.createElement("td");
+      if (!cell || cell.type === "empty") return td;
+      if (cell.type === "text") {
+        td.textContent = cell.text;
+        return td;
+      }
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "service" + (cell.up ? " up" : "");
+      button.disabled = !cell.up;
+      if (!cell.up) button.title = "Nothing is listening on port " + cell.port;
+
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      dot.setAttribute("aria-hidden", "true");
+
+      const copy = document.createElement("span");
+      copy.className = "copy";
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = cell.label;
+      const port = document.createElement("span");
+      port.className = "port";
+      port.textContent = String(cell.port);
+      copy.append(name, port);
+      button.append(dot, copy);
+      if (cell.up) {
+        button.addEventListener("click", () => openLink(button, cell.url));
+      }
+      td.appendChild(button);
+      return td;
+    }
+
+    async function openLink(button, url) {
+      button.disabled = true;
+      try {
+        const response = await fetch("/api/open", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url }),
+        });
+        const payload = await response.json();
+        if (!response.ok) banner(payload.error || "Could not open Chrome");
+        else banner("");
+      } catch (err) {
+        banner("Could not reach WhatsUp");
+      } finally {
+        button.disabled = false;
+      }
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/api/dashboard", { cache: "no-store" });
+        if (!response.ok) throw new Error("status " + response.status);
+        const data = await response.json();
+        render(data);
+        paintSummary(data);
+        timer = setTimeout(refresh, data.refresh_ms || 2000);
+      } catch (err) {
+        banner("WhatsUp is not responding");
+        timer = setTimeout(refresh, 2000);
+      }
+    }
+
+    refresh();
+  </script>
+</body>
+</html>
