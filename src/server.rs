@@ -10,7 +10,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::watch;
 
-use crate::chrome::{open_in_browser, OpenMode};
+use crate::browser::{open_in_browser, OpenMode};
 use crate::config::{config_mtime, load_config, Cell, DashboardConfig, Tone};
 use crate::probe::probe_ports;
 use crate::DASHBOARD_HTML;
