@@ -31,7 +31,7 @@
       min-height: 100vh;
       background: var(--bg);
       color: var(--text);
-      font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font: 15px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Ubuntu, Cantarell, "Noto Sans", sans-serif;
     }
 
     header {
@@ -433,7 +433,7 @@
           body: JSON.stringify({ url }),
         });
         const payload = await response.json();
-        if (!response.ok) banner(payload.error || "Could not open Chrome");
+        if (!response.ok) banner(payload.error || "Could not open the browser");
         else banner("");
       } catch (err) {
         banner("Could not reach WhatsUp");

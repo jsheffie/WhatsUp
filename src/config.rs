@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use crate::chrome::OpenMode;
+use crate::browser::OpenMode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardConfig {
@@ -88,7 +88,7 @@ pub fn config_mtime(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).and_then(|meta| meta.modified()).ok()
 }
 
-/// Cargo runs use the repo file. The packaged app uses Application Support.
+/// Cargo runs use the repo file. Installed builds use the per-user config dir.
 pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     if let Some(path) = explicit {
         return Ok(path);
@@ -103,7 +103,7 @@ pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf, String>
 }
 
 pub fn user_config_path() -> Result<PathBuf, String> {
-    let dir = app_support_dir()?;
+    let dir = config_dir()?;
     fs::create_dir_all(&dir).map_err(|err| format!("could not create {}: {err}", dir.display()))?;
     let path = dir.join("config.json");
     if !path.exists() {
@@ -113,12 +113,85 @@ pub fn user_config_path() -> Result<PathBuf, String> {
     Ok(path)
 }
 
-pub fn app_support_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    Ok(PathBuf::from(home)
+/// Where the user's config.json lives.
+///
+/// macOS: `~/Library/Application Support/WhatsUp`.
+/// Elsewhere: `$XDG_CONFIG_HOME/whatsup`, else `~/.config/whatsup`.
+pub fn config_dir() -> Result<PathBuf, String> {
+    platform_dirs(&env_lookup).map(|dirs| dirs.config)
+}
+
+/// Where the single-instance file lives.
+///
+/// macOS: next to the config. Elsewhere: `$XDG_RUNTIME_DIR/whatsup`, which the
+/// session clears on logout, else `$XDG_STATE_HOME/whatsup` (`~/.local/state`).
+pub fn runtime_dir() -> Result<PathBuf, String> {
+    platform_dirs(&env_lookup).map(|dirs| dirs.runtime)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Dirs {
+    config: PathBuf,
+    runtime: PathBuf,
+}
+
+fn env_lookup(key: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(key)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Dirs, String> {
+    mac_dirs(env)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Dirs, String> {
+    xdg_dirs(env)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn mac_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Dirs, String> {
+    let home = home(env)?;
+    let dir = home
         .join("Library")
         .join("Application Support")
-        .join("WhatsUp"))
+        .join("WhatsUp");
+    Ok(Dirs {
+        config: dir.clone(),
+        runtime: dir,
+    })
+}
+
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn xdg_dirs(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<Dirs, String> {
+    // The XDG spec says relative values are invalid and must be ignored.
+    let absolute = |key: &str| {
+        env(key)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    };
+    let config = match absolute("XDG_CONFIG_HOME") {
+        Some(base) => base,
+        None => home(env)?.join(".config"),
+    };
+    let runtime = match absolute("XDG_RUNTIME_DIR") {
+        Some(base) => base,
+        None => match absolute("XDG_STATE_HOME") {
+            Some(base) => base,
+            None => home(env)?.join(".local").join("state"),
+        },
+    };
+    Ok(Dirs {
+        config: config.join("whatsup"),
+        runtime: runtime.join("whatsup"),
+    })
+}
+
+fn home(env: &dyn Fn(&str) -> Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    env("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| "HOME is not set".to_string())
 }
 
 fn dev_config_path() -> Option<PathBuf> {
@@ -410,6 +483,52 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("does not match"), "{error}");
+    }
+
+    fn fake_env(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.into())
+        }
+    }
+
+    #[test]
+    fn xdg_dirs_follow_the_spec_and_fall_back_to_home() {
+        let set = fake_env(&[
+            ("HOME", "/home/me"),
+            ("XDG_CONFIG_HOME", "/cfg"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+        ]);
+        assert_eq!(
+            xdg_dirs(&set).unwrap(),
+            Dirs {
+                config: PathBuf::from("/cfg/whatsup"),
+                runtime: PathBuf::from("/run/user/1000/whatsup"),
+            }
+        );
+
+        let bare = fake_env(&[("HOME", "/home/me"), ("XDG_CONFIG_HOME", "relative")]);
+        assert_eq!(
+            xdg_dirs(&bare).unwrap(),
+            Dirs {
+                config: PathBuf::from("/home/me/.config/whatsup"),
+                runtime: PathBuf::from("/home/me/.local/state/whatsup"),
+            }
+        );
+
+        assert!(xdg_dirs(&fake_env(&[])).is_err());
+    }
+
+    #[test]
+    fn mac_dirs_keep_everything_in_application_support() {
+        let dirs = mac_dirs(&fake_env(&[("HOME", "/Users/me")])).unwrap();
+        let expected = PathBuf::from("/Users/me/Library/Application Support/WhatsUp");
+        assert_eq!(dirs.config, expected);
+        assert_eq!(dirs.runtime, expected);
     }
 
     #[test]

@@ -8,8 +8,8 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 
-use whatsup::chrome::open_in_browser;
-use whatsup::config::{load_config, resolve_config_path};
+use whatsup::browser::open_in_browser;
+use whatsup::config::{config_dir, load_config, resolve_config_path};
 use whatsup::instance;
 use whatsup::server::{router, AppState, SystemOpener};
 use whatsup::PREFERRED_PORT;
@@ -37,7 +37,7 @@ fn run() -> Result<(), String> {
     let instance_path = instance::instance_path()?;
 
     if let Some(running) = instance::read_running(&instance_path)? {
-        if running.pid != std::process::id() && process_is_running(running.pid) {
+        if running.pid != std::process::id() && instance::process_alive(running.pid) {
             if !args.no_open {
                 let url = format!("http://127.0.0.1:{}/", running.port);
                 open_in_browser(&config.browser_app, &url, config.open)?;
@@ -101,7 +101,7 @@ fn run() -> Result<(), String> {
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 if let Err(err) = open_in_browser(&browser, &page, mode) {
-                    eprintln!("whatsup: started, but could not open {page} in Chrome: {err}");
+                    eprintln!("whatsup: started, but could not open {page} in {browser}: {err}");
                 }
             });
         }
@@ -129,17 +129,6 @@ async fn bind_listener(preferred: u16) -> Result<TcpListener, String> {
     }
 }
 
-fn process_is_running(pid: u32) -> bool {
-    if pid == 0 {
-        return false;
-    }
-    unsafe { kill(pid as i32, 0) == 0 }
-}
-
-extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
     let mut parsed = Args {
         config: None,
@@ -163,8 +152,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 parsed.port = Some(port);
             }
             "--help" | "-h" => {
+                let user_config = config_dir()
+                    .map(|dir| dir.join("config.json").display().to_string())
+                    .unwrap_or_else(|err| format!("(unavailable: {err})"));
                 println!(
-                    "WhatsUp\n\n  whatsup [--config PATH] [--port PORT] [--no-open]\n\nThe dashboard config is JSON. cargo run reads config/whatsup.json.\nThe Mac app reads ~/Library/Application Support/WhatsUp/config.json."
+                    "WhatsUp\n\n  whatsup [--config PATH] [--port PORT] [--no-open]\n\nThe dashboard config is JSON. cargo run reads config/whatsup.json.\nAn installed WhatsUp reads {user_config}."
                 );
                 std::process::exit(0);
             }
