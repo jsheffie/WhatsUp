@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
@@ -38,6 +38,14 @@ pub fn ssh_args(remote: &Remote) -> Vec<String> {
         remote.ssh.clone(),
     ]
     .into()
+}
+
+/// ssh prints a line for every SOCKS CONNECT the remote refused; with one
+/// probe per down port every refresh, those are routine, not errors.
+pub fn is_probe_noise(line: &str) -> bool {
+    line.strip_prefix("channel ")
+        .and_then(|rest| rest.split_once(": open failed:"))
+        .is_some_and(|(number, _)| number.chars().all(|ch| ch.is_ascii_digit()))
 }
 
 pub struct Backoff {
@@ -166,19 +174,22 @@ async fn supervise(program: PathBuf, remote: Remote, state: Arc<Mutex<TunnelStat
             Err(err) => format!("could not run {}: {err}", program.display()),
             Ok(mut child) => {
                 set(TunnelState::Running);
-                let mut stderr = child.stderr.take();
-                let mut output = String::new();
+                // ssh may run for days; keep only the last meaningful line.
+                let stderr = child.stderr.take();
                 let read = async {
-                    if let Some(stderr) = stderr.as_mut() {
-                        let _ = stderr.read_to_string(&mut output).await;
+                    let mut last_line = None;
+                    if let Some(stderr) = stderr {
+                        let mut lines = BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let line = line.trim();
+                            if !line.is_empty() && !is_probe_noise(line) {
+                                last_line = Some(line.to_string());
+                            }
+                        }
                     }
+                    last_line
                 };
-                let (_, status) = tokio::join!(read, child.wait());
-                let last_line = output
-                    .lines()
-                    .map(str::trim)
-                    .rfind(|line| !line.is_empty())
-                    .map(str::to_string);
+                let (last_line, status) = tokio::join!(read, child.wait());
                 match (last_line, status) {
                     (Some(line), _) => line,
                     (None, Ok(status)) => format!("ssh exited ({status})"),
@@ -332,6 +343,37 @@ mod tests {
         tunnels.shutdown();
         let second = read(&pid_file).unwrap();
         assert!(wait_for(|| !alive(&second)).await);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn probe_noise_is_not_an_error() {
+        assert!(is_probe_noise(
+            "channel 22: open failed: connect failed: Connection refused"
+        ));
+        assert!(!is_probe_noise(
+            "bind [127.0.0.1]:47655: Address already in use"
+        ));
+        assert!(!is_probe_noise("Permission denied (publickey)."));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn last_error_skips_channel_noise() {
+        let (dir, script) = stub(
+            "noise",
+            "echo 'channel 2: open failed: connect failed: Connection refused' >&2\necho 'Connection closed by remote host' >&2\necho 'channel 3: open failed: connect failed: Connection refused' >&2\nexit 255",
+        );
+        let tunnels = Tunnels::new(script);
+        tunnels.reconcile(&[lucy()]);
+        let reported = wait_for(|| {
+            tunnels.state("lucy")
+                == Some(TunnelState::Waiting {
+                    last_error: "Connection closed by remote host".into(),
+                })
+        })
+        .await;
+        assert!(reported, "state was {:?}", tunnels.state("lucy"));
+        tunnels.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
 
