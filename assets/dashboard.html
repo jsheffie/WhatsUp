@@ -387,8 +387,11 @@
     }
 
     function render(data) {
-      document.title = data.title || "WhatsUp";
-      titleEl.textContent = data.title || "WhatsUp";
+      // Name the machine whenever the config knows about several, so a
+      // dashboard reached through a proxied profile cannot pass for this one.
+      const title = (data.title || "WhatsUp") + (data.show_machine && data.machine ? " · " + data.machine : "");
+      document.title = title;
+      titleEl.textContent = title;
       paintSummary(data);
       banner(data.config_error || "");
       const nextView = viewKey(data);

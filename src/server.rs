@@ -269,6 +269,7 @@ fn view(
         "ports_up": local.counts.0,
         "ports_total": local.counts.1,
         "machine": local.name,
+        "show_machine": !config.remotes.is_empty() || !config.machine_names.is_empty(),
         "machines": machines.iter().map(|machine| json!({
             "name": machine.name,
             "local": machine.local,
@@ -427,6 +428,7 @@ mod tests {
             assert!(json.get(key).is_some(), "missing {key}");
         }
         assert_eq!(json["machine"], HOSTNAME);
+        assert_eq!(json["show_machine"], false);
         assert_eq!(
             json["machines"],
             serde_json::json!([{
@@ -462,6 +464,9 @@ mod tests {
             .map(|group| group["key"].as_str().unwrap())
             .collect();
         assert_eq!(keys, [format!("{HOSTNAME}/g").as_str(), "lucy/g"]);
+        // Configs that know about machines always say whose dashboard this is,
+        // so lucy's own page opened through a proxied window is recognizable.
+        assert_eq!(json["show_machine"], true);
         let lucy = &json["groups"][1];
         assert_eq!(lucy["machine"], "lucy");
         assert_eq!(lucy["rows"][0]["cells"][0]["up"], true);
