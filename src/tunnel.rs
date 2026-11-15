@@ -174,20 +174,31 @@ async fn supervise(program: PathBuf, remote: Remote, state: Arc<Mutex<TunnelStat
             Err(err) => format!("could not run {}: {err}", program.display()),
             Ok(mut child) => {
                 set(TunnelState::Running);
-                // ssh may run for days; keep only the last meaningful line.
+                // ssh may run for days, so keep only two lines: the first
+                // meaningful one usually names the cause ("bind ...: Address
+                // already in use"), the last one what ssh did about it.
                 let stderr = child.stderr.take();
                 let read = async {
-                    let mut last_line = None;
+                    let mut first: Option<String> = None;
+                    let mut last: Option<String> = None;
                     if let Some(stderr) = stderr {
                         let mut lines = BufReader::new(stderr).lines();
                         while let Ok(Some(line)) = lines.next_line().await {
                             let line = line.trim();
-                            if !line.is_empty() && !is_probe_noise(line) {
-                                last_line = Some(line.to_string());
+                            if line.is_empty() || is_probe_noise(line) {
+                                continue;
+                            }
+                            if first.is_none() {
+                                first = Some(line.to_string());
+                            } else {
+                                last = Some(line.to_string());
                             }
                         }
                     }
-                    last_line
+                    match (first, last) {
+                        (Some(first), Some(last)) => Some(format!("{first}; {last}")),
+                        (first, _) => first,
+                    }
                 };
                 let (last_line, status) = tokio::join!(read, child.wait());
                 match (last_line, status) {
@@ -381,7 +392,8 @@ mod tests {
     async fn failing_tunnel_reports_its_error() {
         let (dir, script) = stub(
             "failing",
-            "echo 'bind [127.0.0.1]:47655: Address already in use' >&2\nexit 255",
+            // What OpenSSH really prints when the forward port is taken.
+            "echo 'bind [127.0.0.1]:47695: Address already in use' >&2\necho 'channel_setup_fwd_listener_tcpip: cannot listen to port: 47695' >&2\necho 'Could not request local forwarding.' >&2\nexit 255",
         );
         let tunnels = Tunnels::new(script);
         tunnels.reconcile(&[lucy()]);
