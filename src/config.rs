@@ -45,6 +45,18 @@ pub struct Group {
 pub struct Row {
     pub tone: Tone,
     pub cells: Vec<Cell>,
+    /// Machines this row belongs to; `None` shows it on every machine.
+    pub machines: Option<Vec<String>>,
+}
+
+impl Row {
+    pub fn shown_on(&self, machine: &str) -> bool {
+        self.machines.as_ref().is_none_or(|machines| {
+            machines
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(machine))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +98,23 @@ impl DashboardConfig {
 
     pub fn allows_url(&self, url: &str) -> bool {
         self.links().any(|link| link.url == url)
+    }
+
+    /// The links of the rows shown on `machine`.
+    pub fn links_on<'a>(&'a self, machine: &'a str) -> impl Iterator<Item = &'a Link> + 'a {
+        self.groups
+            .iter()
+            .flat_map(|group| group.rows.iter())
+            .filter(move |row| row.shown_on(machine))
+            .flat_map(|row| row.cells.iter())
+            .filter_map(|cell| match cell {
+                Cell::Link(link) => Some(link),
+                _ => None,
+            })
+    }
+
+    pub fn allows_url_on(&self, url: &str, machine: &str) -> bool {
+        self.links_on(machine).any(|link| link.url == url)
     }
 
     /// The dashboard label for the machine with this short hostname.
@@ -318,6 +347,8 @@ struct RawRow {
     #[serde(default)]
     tone: Option<String>,
     cells: Vec<Value>,
+    #[serde(default)]
+    machines: Option<Vec<String>>,
 }
 
 fn default_title() -> String {
@@ -420,11 +451,22 @@ impl RawRow {
                 ))
             }
         };
+        if let Some(machines) = &self.machines {
+            if machines.is_empty() || machines.iter().any(|name| name.trim().is_empty()) {
+                return Err(format!(
+                    "group {group_id} row {index} machines must list machine names"
+                ));
+            }
+        }
         let mut cells = Vec::with_capacity(self.cells.len());
         for (cell_index, value) in self.cells.into_iter().enumerate() {
             cells.push(parse_cell(group_id, index, cell_index, value)?);
         }
-        Ok(Row { tone, cells })
+        Ok(Row {
+            tone,
+            cells,
+            machines: self.machines,
+        })
     }
 }
 
@@ -661,6 +703,49 @@ mod tests {
         assert!(config.active_remotes("lucy").is_empty());
         assert!(config.active_remotes("Lucy").is_empty());
         assert_eq!(config.active_remotes("megan").len(), 1);
+    }
+
+    #[test]
+    fn rows_can_be_limited_to_machines() {
+        let config = parse_config(
+            r#"{
+                "groups": [{
+                    "id": "g",
+                    "label": "G",
+                    "columns": ["Name"],
+                    "rows": [
+                        { "cells": [{ "label": "both", "url": "http://localhost:3000" }] },
+                        { "machines": ["lucy"], "cells": [{ "label": "lucy only", "url": "http://localhost:3009" }] }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        let rows = &config.groups[0].rows;
+        assert!(rows[0].shown_on("megan") && rows[0].shown_on("lucy"));
+        assert!(rows[1].shown_on("lucy") && rows[1].shown_on("Lucy"));
+        assert!(!rows[1].shown_on("megan"));
+        let ports = |machine: &str| -> Vec<u16> {
+            config.links_on(machine).map(|link| link.port).collect()
+        };
+        assert_eq!(ports("megan"), [3000]);
+        assert_eq!(ports("lucy"), [3000, 3009]);
+        assert!(config.allows_url_on("http://localhost:3009", "lucy"));
+        assert!(!config.allows_url_on("http://localhost:3009", "megan"));
+        // Every link is still known to the config as a whole.
+        assert_eq!(config.links().count(), 2);
+
+        for bad in [
+            r#""machines": []"#,
+            r#""machines": [" "]"#,
+            r#""machines": "lucy""#,
+        ] {
+            let text = format!(
+                r#"{{ "groups": [{{ "id": "g", "label": "G", "columns": ["Name"],
+                    "rows": [{{ {bad}, "cells": ["x"] }}] }}] }}"#
+            );
+            assert!(parse_config(&text).is_err(), "accepted {bad}");
+        }
     }
 
     #[test]

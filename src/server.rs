@@ -130,17 +130,17 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
 
     // Start every probe before awaiting any, so a slow remote never delays
     // the local status (each remote probe is bounded by its timeouts).
-    let ports: Vec<u16> = config.ports().into_iter().collect();
+    let ports: std::collections::BTreeSet<u16> =
+        config.links_on(&local).map(|link| link.port).collect();
     let local_probe = tokio::task::spawn_blocking(move || probe_ports(ports));
-    let targets: Vec<(String, u16)> = config
-        .links()
-        .map(|link| (link.host.clone(), link.port))
-        .collect();
     let remote_probes: Vec<_> = remotes
         .iter()
         .map(|remote| {
             let socks_port = remote.socks_port;
-            let targets = targets.clone();
+            let targets: Vec<(String, u16)> = config
+                .links_on(&remote.name)
+                .map(|link| (link.host.clone(), link.port))
+                .collect();
             tokio::task::spawn_blocking(move || probe_remote(socks_port, targets))
         })
         .collect();
@@ -205,7 +205,7 @@ struct MachineStatus {
 /// Local status is per port, as before: distinct ports, and how many are up.
 fn count_local(config: &DashboardConfig, machine: &MachineStatus) -> (usize, usize) {
     let mut by_port: BTreeMap<u16, bool> = BTreeMap::new();
-    for link in config.links() {
+    for link in config.links_on(&machine.name) {
         *by_port.entry(link.port).or_default() |= (machine.up)(link);
     }
     (by_port.values().filter(|up| **up).count(), by_port.len())
@@ -222,10 +222,11 @@ async fn open_link(State(state): State<AppState>, Json(request): Json<OpenReques
     let (config, _) = state.reload();
     let bad =
         |error: String| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
-    if !config.allows_url(&request.url) {
+    let local = state.local_label(&config);
+    let machine = request.machine.as_deref().unwrap_or(&local);
+    if !config.allows_url_on(&request.url, machine) {
         return bad("that url is not in the dashboard config".into());
     }
-    let local = state.local_label(&config);
     let opener = &state.inner.opener;
     let result = match request.machine.as_deref() {
         None => opener.open(&config.browser_app, &request.url, config.open),
@@ -280,7 +281,13 @@ fn view(
         })).collect::<Vec<_>>(),
         "groups": machines
             .iter()
-            .flat_map(|machine| config.groups.iter().map(move |group| group_view(group, machine)))
+            .flat_map(|machine| {
+                config
+                    .groups
+                    .iter()
+                    .filter(move |group| group.rows.iter().any(|row| row.shown_on(&machine.name)))
+                    .map(move |group| group_view(group, machine))
+            })
             .collect::<Vec<_>>(),
     })
 }
@@ -292,7 +299,7 @@ fn group_view(group: &Group, machine: &MachineStatus) -> Value {
         "machine": machine.name,
         "label": group.label,
         "columns": group.columns,
-        "rows": group.rows.iter().map(|row| {
+        "rows": group.rows.iter().filter(|row| row.shown_on(&machine.name)).map(|row| {
             json!({
                 "tone": match row.tone {
                     Tone::Gray => "gray",
@@ -478,6 +485,66 @@ mod tests {
         assert_eq!(machine["note"], Value::Null);
         assert_eq!(machine["ports_up"], 1);
         assert_eq!(machine["ports_total"], 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn machine_rows_show_only_on_their_machine() {
+        let (socks_port, _requests) =
+            crate::socks::fake::start(|_, _| crate::socks::fake::Act::Reply(0));
+        let config = format!(
+            r#"{{
+                "remotes": [{{ "name": "lucy", "ssh": "lucy", "browser_profile": "megan:Lucy", "socks_port": {socks_port} }}],
+                "groups": [{{
+                    "id": "g",
+                    "label": "Services",
+                    "columns": ["Up", "Down"],
+                    "rows": [
+                        {{ "cells": [
+                            {{ "label": "up", "url": "http://localhost:3000/" }},
+                            {{ "label": "down", "url": "http://jds.local.me:3001/" }}
+                        ] }},
+                        {{ "machines": ["lucy"], "cells": [
+                            {{ "label": "lucy only", "url": "http://localhost:3009/" }},
+                            null
+                        ] }}
+                    ]
+                }}]
+            }}"#
+        );
+        let (addr, opener, dir) = serve("rows", &config).await;
+        let json = dashboard_json(addr).await;
+        let rows = |key: &str| {
+            json["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|group| group["key"] == key)
+                .map(|group| group["rows"].as_array().unwrap().len())
+                .unwrap()
+        };
+        assert_eq!(rows(&format!("{HOSTNAME}/g")), 1);
+        assert_eq!(rows("lucy/g"), 2);
+        assert_eq!(
+            json["ports_total"], 2,
+            "the lucy-only port is not probed locally"
+        );
+        assert_eq!(json["machines"][1]["ports_total"], 3);
+
+        let post = move |body: &'static str| {
+            tokio::task::spawn_blocking(move || http(addr, "POST", "/api/open", Some(body)).0)
+        };
+        assert_eq!(
+            post(r#"{"url":"http://localhost:3009/"}"#).await.unwrap(),
+            400
+        );
+        assert_eq!(
+            post(r#"{"url":"http://localhost:3009/","machine":"lucy"}"#)
+                .await
+                .unwrap(),
+            200
+        );
+        assert_eq!(opener.0.lock().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -70,6 +70,7 @@ WhatsUp can also show the stacks of another machine on the same network, and ope
   - `ssh` is a host from `~/.ssh/config` that logs in without a prompt.
   - `browser_profile` is the display name of the Chrome profile that opens its links.
   - `socks_port` is optional (default `47655`).
+- A row can carry `"machines": ["lucy"]` to show only on those machines (by label), for stacks that exist on one machine only. Rows without it show everywhere.
 - `machine_names`: optional labels for short hostnames (`hostname -s`). A remote whose `name` matches this machine's label is ignored, so one shared config works on every machine.
 
 How it works:
