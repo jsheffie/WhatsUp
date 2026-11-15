@@ -1,11 +1,14 @@
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::browser::OpenMode;
+
+/// Where WhatsUp's SSH tunnel to a remote machine listens by default.
+pub const DEFAULT_SOCKS_PORT: u16 = 47655;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DashboardConfig {
@@ -14,6 +17,20 @@ pub struct DashboardConfig {
     pub open: OpenMode,
     pub browser_app: String,
     pub groups: Vec<Group>,
+    pub remotes: Vec<Remote>,
+    /// Short hostname -> label shown on the dashboard (e.g. a Mac's
+    /// generated hostname -> "megan").
+    pub machine_names: BTreeMap<String, String>,
+}
+
+/// Another machine whose stacks are mirrored on this dashboard, reached
+/// through an SSH SOCKS tunnel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    pub name: String,
+    pub ssh: String,
+    pub browser_profile: String,
+    pub socks_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +64,7 @@ pub enum Cell {
 pub struct Link {
     pub label: String,
     pub url: String,
+    pub host: String,
     pub port: u16,
 }
 
@@ -68,6 +86,28 @@ impl DashboardConfig {
 
     pub fn allows_url(&self, url: &str) -> bool {
         self.links().any(|link| link.url == url)
+    }
+
+    /// The dashboard label for the machine with this short hostname.
+    pub fn machine_label(&self, hostname: &str) -> String {
+        self.machine_names
+            .get(hostname)
+            .cloned()
+            .unwrap_or_else(|| hostname.to_string())
+    }
+
+    /// Remotes to tunnel to from the machine labelled `local_label`; a remote
+    /// naming this machine itself is skipped.
+    pub fn active_remotes(&self, local_label: &str) -> Vec<Remote> {
+        self.remotes
+            .iter()
+            .filter(|remote| !remote.name.eq_ignore_ascii_case(local_label))
+            .cloned()
+            .collect()
+    }
+
+    pub fn remote(&self, name: &str) -> Option<&Remote> {
+        self.remotes.iter().find(|remote| remote.name == name)
     }
 }
 
@@ -213,6 +253,54 @@ struct RawConfig {
     #[serde(default = "default_browser")]
     browser_app: String,
     groups: Vec<RawGroup>,
+    #[serde(default)]
+    remotes: Vec<RawRemote>,
+    #[serde(default)]
+    machine_names: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRemote {
+    name: String,
+    ssh: String,
+    browser_profile: String,
+    #[serde(default)]
+    socks_port: Option<u16>,
+}
+
+impl RawRemote {
+    fn into_remote(self) -> Result<Remote, String> {
+        let at = format!("remote {}", self.name);
+        if self.name.trim().is_empty() {
+            return Err("remote name is empty".into());
+        }
+        if self.ssh.is_empty()
+            || self.ssh.starts_with('-')
+            || self
+                .ssh
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(format!("{at} ssh must be one ssh host name"));
+        }
+        if self.browser_profile.trim().is_empty() {
+            return Err(format!("{at} browser_profile is empty"));
+        }
+        let socks_port = self.socks_port.unwrap_or(DEFAULT_SOCKS_PORT);
+        if socks_port == 0 || socks_port == crate::PREFERRED_PORT {
+            return Err(format!(
+                "{at} socks_port must be a free tcp port other than {}",
+                crate::PREFERRED_PORT
+            ));
+        }
+        Ok(Remote {
+            name: self.name,
+            ssh: self.ssh,
+            browser_profile: self.browser_profile,
+            socks_port,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,12 +352,22 @@ impl RawConfig {
             }
             groups.push(group.into_group()?);
         }
+        let mut seen_remotes = BTreeSet::new();
+        let mut remotes = Vec::with_capacity(self.remotes.len());
+        for remote in self.remotes {
+            if !seen_remotes.insert(remote.name.to_ascii_lowercase()) {
+                return Err(format!("duplicate remote {}", remote.name));
+            }
+            remotes.push(remote.into_remote()?);
+        }
         Ok(DashboardConfig {
             title: self.title,
             refresh_ms,
             open: self.open,
             browser_app: self.browser_app,
             groups,
+            remotes,
+            machine_names: self.machine_names,
         })
     }
 }
@@ -366,7 +464,13 @@ fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result
                     return Err(format!("{at} has unknown field {key}"));
                 }
             }
-            Ok(Cell::Link(Link { label, url, port }))
+            let host = host_from_url(&url)?;
+            Ok(Cell::Link(Link {
+                label,
+                url,
+                host,
+                port,
+            }))
         }
         _ => Err(format!("{at} must be a string, a link, or null")),
     }
@@ -398,7 +502,8 @@ fn validate_url(url: &str, at: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn port_from_url(url: &str) -> Result<u16, String> {
+/// The scheme and the `host[:port]` part of an http(s) url.
+fn scheme_and_hostport(url: &str) -> Result<(&'static str, &str), String> {
     let (scheme, rest) = url
         .strip_prefix("https://")
         .map(|rest| ("https", rest))
@@ -406,6 +511,25 @@ pub fn port_from_url(url: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("{url} is not an http url"))?;
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let hostport = authority.split('@').next_back().unwrap_or(authority);
+    Ok((scheme, hostport))
+}
+
+/// The lowercased host of an http(s) url; IPv6 hosts come without brackets.
+pub fn host_from_url(url: &str) -> Result<String, String> {
+    let (_, hostport) = scheme_and_hostport(url)?;
+    let host = if let Some(rest) = hostport.strip_prefix('[') {
+        rest.split_once(']').map(|(host, _)| host)
+    } else {
+        Some(hostport.split(':').next().unwrap_or(hostport))
+    };
+    match host {
+        Some(host) if !host.is_empty() => Ok(host.to_ascii_lowercase()),
+        _ => Err(format!("{url} has no host")),
+    }
+}
+
+pub fn port_from_url(url: &str) -> Result<u16, String> {
+    let (scheme, hostport) = scheme_and_hostport(url)?;
     let port_text = if let Some(rest) = hostport.strip_prefix('[') {
         rest.split_once("]:").map(|(_, port)| port)
     } else {
@@ -454,6 +578,100 @@ mod tests {
         let blog = find("blog");
         assert_eq!(blog.url, "http://localhost:1313/");
         assert_eq!(blog.port, 1313);
+        assert_eq!(frontend.host, "localhost");
+        assert!(config.remotes.is_empty());
+        assert!(config.machine_names.is_empty());
+    }
+
+    fn with_top_level(extra: &str) -> String {
+        format!(
+            r#"{{
+                {extra}
+                "groups": [{{
+                    "id": "g",
+                    "label": "G",
+                    "columns": ["Name"],
+                    "rows": [{{ "cells": [{{ "label": "web", "url": "http://localhost:3000" }}] }}]
+                }}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn parses_remotes_with_defaults() {
+        let config = parse_config(&with_top_level(
+            r#""remotes": [{ "name": "lucy", "ssh": "lucy", "browser_profile": "megan:Lucy" }],"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            config.remotes,
+            vec![Remote {
+                name: "lucy".into(),
+                ssh: "lucy".into(),
+                browser_profile: "megan:Lucy".into(),
+                socks_port: 47655,
+            }]
+        );
+        assert_eq!(DEFAULT_SOCKS_PORT, 47655);
+
+        let custom = parse_config(&with_top_level(
+            r#""remotes": [{ "name": "lucy", "ssh": "lucy", "browser_profile": "megan:Lucy", "socks_port": 40000 }],"#,
+        ))
+        .unwrap();
+        assert_eq!(custom.remotes[0].socks_port, 40000);
+        assert_eq!(custom.remote("lucy").unwrap().socks_port, 40000);
+        assert!(custom.remote("megan").is_none());
+    }
+
+    #[test]
+    fn rejects_bad_remotes() {
+        let bad = [
+            r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P" }, { "name": "lucy", "ssh": "x", "browser_profile": "P" }"#,
+            r#"{ "name": " ", "ssh": "lucy", "browser_profile": "P" }"#,
+            r#"{ "name": "lucy", "ssh": "", "browser_profile": "P" }"#,
+            r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "" }"#,
+            r#"{ "name": "lucy", "ssh": "-oProxyCommand=evil", "browser_profile": "P" }"#,
+            r#"{ "name": "lucy", "ssh": "lucy host", "browser_profile": "P" }"#,
+            r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "socks_port": 0 }"#,
+            r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "socks_port": 47654 }"#,
+            r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "extra": 1 }"#,
+        ];
+        for remotes in bad {
+            let text = with_top_level(&format!(r#""remotes": [{remotes}],"#));
+            assert!(parse_config(&text).is_err(), "accepted {remotes}");
+        }
+    }
+
+    #[test]
+    fn machine_label_maps_hostnames() {
+        let config = parse_config(&with_top_level(
+            r#""machine_names": { "Jeffs-MacBook-Pro-2": "megan" },"#,
+        ))
+        .unwrap();
+        assert_eq!(config.machine_label("Jeffs-MacBook-Pro-2"), "megan");
+        assert_eq!(config.machine_label("lucy"), "lucy");
+    }
+
+    #[test]
+    fn active_remotes_skip_the_local_machine() {
+        let config = parse_config(&with_top_level(
+            r#""remotes": [{ "name": "lucy", "ssh": "lucy", "browser_profile": "megan:Lucy" }],"#,
+        ))
+        .unwrap();
+        assert!(config.active_remotes("lucy").is_empty());
+        assert!(config.active_remotes("Lucy").is_empty());
+        assert_eq!(config.active_remotes("megan").len(), 1);
+    }
+
+    #[test]
+    fn host_from_url_cases() {
+        assert_eq!(
+            host_from_url("http://jds4.local.me:3004/").unwrap(),
+            "jds4.local.me"
+        );
+        assert_eq!(host_from_url("http://LOCALHOST:4004").unwrap(), "localhost");
+        assert_eq!(host_from_url("http://[::1]:2023/admin/").unwrap(), "::1");
+        assert_eq!(host_from_url("https://u@h.example/x").unwrap(), "h.example");
     }
 
     #[test]
