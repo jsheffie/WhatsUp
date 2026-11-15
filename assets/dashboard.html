@@ -22,6 +22,8 @@
       --black-all-up: #143524;
       --chip: #15181d;
       --focus: #ffd166;
+      --remote: #d2a8ff;
+      --remote-line: #6e40c9;
     }
 
     * { box-sizing: border-box; }
@@ -108,14 +110,45 @@
       font-weight: 600;
     }
 
+    nav.tabs .divider {
+      align-self: center;
+      width: 1px;
+      height: 16px;
+      background: var(--line);
+    }
+
     .panel h2 {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
       margin: 22px 0 8px;
       font-size: 15px;
       font-weight: 650;
       letter-spacing: 0.01em;
     }
 
-    .panel h2:first-child { margin-top: 0; }
+    .panel.first h2 { margin-top: 0; }
+    .panel h2.hidden { display: none; }
+
+    .tag {
+      padding: 1px 8px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font: 500 11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+
+    .tag.remote {
+      border-color: var(--remote-line);
+      color: var(--remote);
+    }
+
+    .note {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 400;
+    }
 
     main { padding: 22px 28px 40px; }
 
@@ -188,6 +221,11 @@
       box-shadow: 0 0 0 3px rgba(61, 214, 140, 0.14);
     }
 
+    .service.offline .dot {
+      background: var(--muted);
+      box-shadow: 0 0 0 3px rgba(154, 163, 173, 0.12);
+    }
+
     .copy { display: flex; flex-direction: column; min-width: 0; }
     .name { font-weight: 550; }
     .port {
@@ -246,10 +284,18 @@
     const quitEl = document.getElementById("quit");
 
     const requestedGroup = new URLSearchParams(location.search).get("group");
-    let activeGroup = requestedGroup || sessionStorage.getItem("whatsup-tab") || "";
+    let activeFilter = asFilter(requestedGroup || sessionStorage.getItem("whatsup-tab") || "");
     let timer = 0;
     let lastView = "";
+    let multiMachine = false;
     upOnlyEl.checked = localStorage.getItem("whatsup-up-only") === "1";
+
+    // Tabs filter sections: "all", "machine:<name>" or "group:<id>". Older
+    // stored values are bare group ids.
+    function asFilter(value) {
+      if (!value || value === "all" || value.includes(":")) return value || "all";
+      return "group:" + value;
+    }
 
     upOnlyEl.addEventListener("change", () => {
       localStorage.setItem("whatsup-up-only", upOnlyEl.checked ? "1" : "0");
@@ -270,12 +316,24 @@
       bannerEl.classList.toggle("show", Boolean(text));
     }
 
+    function shows(panel) {
+      if (activeFilter === "all") return true;
+      const [kind, value] = activeFilter.split(/:(.*)/s);
+      return kind === "machine" ? panel.dataset.machine === value : panel.dataset.group === value;
+    }
+
     function applyGroupVisibility() {
       document.querySelectorAll("#tabs button").forEach((button) => {
-        button.setAttribute("aria-selected", button.dataset.group === activeGroup ? "true" : "false");
+        button.setAttribute("aria-selected", button.dataset.filter === activeFilter ? "true" : "false");
       });
+      let first = true;
       document.querySelectorAll("#tables > .panel").forEach((panel) => {
-        panel.hidden = panel.dataset.group !== activeGroup;
+        panel.hidden = !shows(panel);
+        panel.classList.toggle("first", !panel.hidden && first);
+        if (!panel.hidden) first = false;
+        // With one machine a group tab shows just its table, as it always has.
+        const heading = panel.querySelector("h2");
+        heading.classList.toggle("hidden", !multiMachine && activeFilter.startsWith("group:"));
       });
     }
 
@@ -292,10 +350,40 @@
       return JSON.stringify(copy);
     }
 
+    function machinesOf(data) {
+      return data.machines || [{ name: data.machine || "", local: true, offline: false, note: null }];
+    }
+
     function paintSummary(data) {
       const when = new Date(data.checked_at_ms);
       const clock = when.toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" });
-      summaryEl.textContent = data.ports_up + " of " + data.ports_total + " ports listening · " + clock;
+      const remotes = machinesOf(data).filter((machine) => !machine.local).map((machine) =>
+        machine.offline
+          ? " · " + machine.name + " offline"
+          : " · " + machine.name + " " + machine.ports_up + " of " + machine.ports_total
+      );
+      summaryEl.textContent =
+        data.ports_up + " of " + data.ports_total + " ports listening" + remotes.join("") + " · " + clock;
+    }
+
+    function tabButton(filter, label) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.filter = filter;
+      button.textContent = label;
+      button.addEventListener("click", () => {
+        activeFilter = filter;
+        sessionStorage.setItem("whatsup-tab", activeFilter);
+        applyGroupVisibility();
+      });
+      return button;
+    }
+
+    function divider() {
+      const line = document.createElement("span");
+      line.className = "divider";
+      line.setAttribute("aria-hidden", "true");
+      return line;
     }
 
     function render(data) {
@@ -307,50 +395,66 @@
       if (nextView === lastView) return;
       lastView = nextView;
 
-      const ids = ["all", ...data.groups.map((group) => group.id)];
-      if (!ids.includes(activeGroup)) activeGroup = "all";
-
-      tabsEl.replaceChildren();
-      [{ id: "all", label: "All" }, ...data.groups].forEach((group) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.dataset.group = group.id;
-        button.textContent = group.label;
-        button.addEventListener("click", () => {
-          activeGroup = group.id;
-          sessionStorage.setItem("whatsup-tab", activeGroup);
-          applyGroupVisibility();
-        });
-        tabsEl.appendChild(button);
+      const machines = machinesOf(data);
+      const byName = Object.fromEntries(machines.map((machine) => [machine.name, machine]));
+      multiMachine = machines.length > 1;
+      const groups = [];
+      data.groups.forEach((group) => {
+        if (!groups.some((known) => known.id === group.id)) groups.push(group);
       });
+
+      const filters = [
+        "all",
+        ...(multiMachine ? machines.map((machine) => "machine:" + machine.name) : []),
+        ...groups.map((group) => "group:" + group.id),
+      ];
+      if (!filters.includes(activeFilter)) activeFilter = "all";
+
+      tabsEl.replaceChildren(tabButton("all", "All"));
+      if (multiMachine) {
+        machines.forEach((machine) => tabsEl.appendChild(tabButton("machine:" + machine.name, machine.name)));
+        tabsEl.appendChild(divider());
+      }
+      groups.forEach((group) => tabsEl.appendChild(tabButton("group:" + group.id, group.label)));
 
       tablesEl.replaceChildren();
-      const allPanel = document.createElement("div");
-      allPanel.className = "panel";
-      allPanel.dataset.group = "all";
       data.groups.forEach((group) => {
-        const heading = document.createElement("h2");
-        heading.textContent = group.label;
-        allPanel.append(heading, buildTable(group));
-      });
-      tablesEl.appendChild(allPanel);
-      data.groups.forEach((group) => {
+        const machine = byName[group.machine] || machines[0];
         const panel = document.createElement("div");
         panel.className = "panel";
         panel.dataset.group = group.id;
-        panel.appendChild(buildTable(group));
+        panel.dataset.machine = machine.name;
+        const heading = document.createElement("h2");
+        const label = document.createElement("span");
+        label.textContent = group.label;
+        heading.appendChild(label);
+        if (multiMachine) {
+          const tag = document.createElement("span");
+          tag.className = "tag" + (machine.local ? "" : " remote");
+          tag.textContent = machine.name;
+          heading.appendChild(tag);
+          if (machine.note) {
+            const note = document.createElement("span");
+            note.className = "note";
+            note.textContent = machine.note;
+            heading.appendChild(note);
+          }
+        }
+        panel.append(heading, buildTable(group, machine));
         tablesEl.appendChild(panel);
       });
       applyGroupVisibility();
 
       footerEl.replaceChildren();
-      footerEl.append("A port is up when something accepts TCP on 127.0.0.1 or ::1. Config: ");
+      footerEl.append("A port is up when something accepts TCP on 127.0.0.1 or ::1.");
+      if (multiMachine) footerEl.append(" Remote machines are checked through their SSH tunnel.");
+      footerEl.append(" Config: ");
       const code = document.createElement("code");
       code.textContent = data.config_path;
       footerEl.append(code);
     }
 
-    function buildTable(group) {
+    function buildTable(group, machine) {
       const table = document.createElement("table");
       const head = document.createElement("thead");
       const headRow = document.createElement("tr");
@@ -371,7 +475,7 @@
           const tr = document.createElement("tr");
           tr.className = row.tone === "black" ? "black" : "gray";
           tr.classList.toggle("all-up", allUp);
-          row.cells.forEach((cell) => tr.appendChild(renderCell(cell)));
+          row.cells.forEach((cell) => tr.appendChild(renderCell(cell, machine)));
           applyUpOnly(tr);
           body.appendChild(tr);
         });
@@ -390,7 +494,7 @@
       return result;
     }
 
-    function renderCell(cell) {
+    function renderCell(cell, machine) {
       const td = document.createElement("td");
       if (!cell || cell.type === "empty") return td;
       if (cell.type === "text") {
@@ -399,9 +503,10 @@
       }
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "service" + (cell.up ? " up" : "");
+      button.className = "service" + (cell.up ? " up" : "") + (machine.offline ? " offline" : "");
       button.disabled = !cell.up;
-      if (!cell.up) button.title = "Nothing is listening on port " + cell.port;
+      if (machine.offline) button.title = machine.note || machine.name + " is offline";
+      else if (!cell.up) button.title = "Nothing is listening on port " + cell.port;
 
       const dot = document.createElement("span");
       dot.className = "dot";
@@ -418,19 +523,19 @@
       copy.append(name, port);
       button.append(dot, copy);
       if (cell.up) {
-        button.addEventListener("click", () => openLink(button, cell.url));
+        button.addEventListener("click", () => openLink(button, cell.url, machine.name));
       }
       td.appendChild(button);
       return td;
     }
 
-    async function openLink(button, url) {
+    async function openLink(button, url, machine) {
       button.disabled = true;
       try {
         const response = await fetch("/api/open", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url }),
+          body: JSON.stringify({ url, machine }),
         });
         const payload = await response.json();
         if (!response.ok) banner(payload.error || "Could not open the browser");
