@@ -145,9 +145,12 @@ on both machines) gains a remote list, roughly:
 
 - `socks_port` is optional with a fixed default; the extension uses the same
   default.
-- A remote whose `name` matches the local machine's short hostname is
-  ignored, so lucy's own WhatsUp, reading the same file, does not tunnel to
-  itself.
+- A remote whose `name` matches the local machine's label is ignored, so
+  lucy's own WhatsUp, reading the same file, does not tunnel to itself. The
+  label is the short hostname (`hostname -s`), optionally renamed by a
+  top-level `"machine_names": { "<hostname>": "<label>" }` map. Found while
+  planning: megan's hostname is `Jeffs-MacBook-Pro-2`, so the shared config
+  maps it to `megan`; lucy's hostname is already `lucy`.
 - Every remote mirrors all groups; there is no per-group remote selection.
 - Unchanged configs without `remotes` behave exactly as today.
 
