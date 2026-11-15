@@ -12,6 +12,7 @@ use whatsup::browser::open_in_browser;
 use whatsup::config::{config_dir, load_config, resolve_config_path};
 use whatsup::instance;
 use whatsup::server::{router, AppState, SystemOpener};
+use whatsup::tunnel::Tunnels;
 use whatsup::PREFERRED_PORT;
 
 struct Args {
@@ -83,11 +84,14 @@ fn run() -> Result<(), String> {
         println!("Config: {}", config_path.display());
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let tunnels = Arc::new(Tunnels::new(PathBuf::from("ssh")));
         let state = AppState::new(
             config_path,
             config.clone(),
             Arc::new(SystemOpener),
             shutdown_tx,
+            short_hostname(),
+            tunnels.clone(),
         );
         let app = router(state);
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -115,9 +119,23 @@ fn run() -> Result<(), String> {
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
         }
+        tunnels.shutdown();
         drop(lock);
         Ok(())
     })
+}
+
+/// This machine's short hostname (`hostname -s`), which `machine_names` in
+/// the config can turn into a friendlier label.
+fn short_hostname() -> String {
+    std::process::Command::new("hostname")
+        .arg("-s")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 async fn bind_listener(preferred: u16) -> Result<TcpListener, String> {

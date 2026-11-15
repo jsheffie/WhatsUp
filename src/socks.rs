@@ -161,7 +161,6 @@ pub mod fake {
 mod tests {
     use super::fake::{self, Act};
     use super::*;
-    use std::net::{Ipv4Addr, TcpListener};
     use std::time::{Duration, Instant};
 
     const QUICK: Duration = Duration::from_millis(200);
@@ -190,10 +189,8 @@ mod tests {
 
     #[test]
     fn refused_is_offline() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        assert_eq!(socks_reach(port, "localhost", 4004, QUICK), Reach::Offline);
+        // Nothing listens on port 1, and parallel tests cannot take it.
+        assert_eq!(socks_reach(1, "localhost", 4004, QUICK), Reach::Offline);
     }
 
     #[test]
