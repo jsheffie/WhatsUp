@@ -148,6 +148,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
     let mut machines = vec![MachineStatus {
         name: local,
         local: true,
+        offline: false,
         note: None,
         up: Box::new(move |link: &Link| local_status.get(&link.port).copied().unwrap_or(false)),
         counts: (0, 0),
@@ -156,12 +157,18 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
     for (remote, probe) in remotes.iter().zip(remote_probes) {
         let reach = probe.await.expect("remote probe");
         let offline = reach.values().any(|reach| *reach == Reach::Offline);
-        let note = offline.then(|| match state.inner.tunnels.state(&remote.name) {
-            Some(TunnelState::Waiting { last_error }) => {
-                format!("{} offline: {last_error}", remote.name)
-            }
-            _ => format!("{} offline", remote.name),
-        });
+        let tunnel_error = match state.inner.tunnels.state(&remote.name) {
+            Some(TunnelState::Waiting { last_error }) => Some(last_error),
+            _ => None,
+        };
+        // A failing tunnel is worth saying even when probes work: then they
+        // go through a proxy something else left on the port.
+        let note = match (offline, tunnel_error) {
+            (true, Some(error)) => Some(format!("{} offline: {error}", remote.name)),
+            (true, None) => Some(format!("{} offline", remote.name)),
+            (false, Some(error)) => Some(format!("{} tunnel not running: {error}", remote.name)),
+            (false, None) => None,
+        };
         let counts = (
             if offline {
                 0
@@ -173,6 +180,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         machines.push(MachineStatus {
             name: remote.name.clone(),
             local: false,
+            offline,
             note,
             up: Box::new(move |link: &Link| {
                 !offline && reach.get(&(link.host.clone(), link.port)) == Some(&Reach::Up)
@@ -188,15 +196,10 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
 struct MachineStatus {
     name: String,
     local: bool,
+    offline: bool,
     note: Option<String>,
     up: Box<dyn Fn(&Link) -> bool + Send>,
     counts: (usize, usize),
-}
-
-impl MachineStatus {
-    fn offline(&self) -> bool {
-        self.note.is_some()
-    }
 }
 
 /// Local status is per port, as before: distinct ports, and how many are up.
@@ -269,7 +272,7 @@ fn view(
         "machines": machines.iter().map(|machine| json!({
             "name": machine.name,
             "local": machine.local,
-            "offline": machine.offline(),
+            "offline": machine.offline,
             "note": machine.note,
             "ports_up": machine.counts.0,
             "ports_total": machine.counts.1,
@@ -343,9 +346,19 @@ mod tests {
 
     const HOSTNAME: &str = "testhost";
 
-    /// Serves `config_json` with a recording opener; tunnels run `true`, which
-    /// exits at once, so probes go to whatever SOCKS port the config names.
+    /// Serves `config_json` with a recording opener. Tunnels run a stub that
+    /// stays up like a healthy ssh, so probes go to whatever SOCKS port the
+    /// config names.
     async fn serve(name: &str, config_json: &str) -> (SocketAddr, Arc<Recording>, PathBuf) {
+        let (_, program) = crate::tunnel::testing::running_stub(&format!("server-{name}"));
+        serve_with(name, config_json, program).await
+    }
+
+    async fn serve_with(
+        name: &str,
+        config_json: &str,
+        program: PathBuf,
+    ) -> (SocketAddr, Arc<Recording>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("whatsup-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -354,7 +367,7 @@ mod tests {
         let config = load_config(&config_path).unwrap();
         let (shutdown, _rx) = watch::channel(false);
         let opener = Arc::new(Recording(Mutex::new(Vec::new())));
-        let tunnels = Arc::new(Tunnels::new(PathBuf::from("true")));
+        let tunnels = Arc::new(Tunnels::new(program));
         let state = AppState::new(
             config_path,
             config,
@@ -460,6 +473,27 @@ mod tests {
         assert_eq!(machine["note"], Value::Null);
         assert_eq!(machine["ports_up"], 1);
         assert_eq!(machine["ports_total"], 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_tunnel_is_reported_even_when_probes_work() {
+        // Probes succeed through a proxy someone else left on the port, while
+        // our own ssh keeps failing: say so instead of looking healthy.
+        let (socks_port, _requests) =
+            crate::socks::fake::start(|_, _| crate::socks::fake::Act::Reply(0));
+        let (_, program) = crate::tunnel::testing::stub(
+            "server-taken",
+            "echo 'bind [127.0.0.1]:1: Address already in use' >&2\nexit 255",
+        );
+        let (addr, _opener, dir) = serve_with("taken", &remote_config(socks_port), program).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let json = dashboard_json(addr).await;
+        let machine = &json["machines"][1];
+        assert_eq!(machine["offline"], false);
+        let note = machine["note"].as_str().unwrap_or_default();
+        assert!(note.contains("Address already in use"), "{machine}");
+        assert_eq!(json["groups"][1]["rows"][0]["cells"][0]["up"], true);
         let _ = std::fs::remove_dir_all(dir);
     }
 
