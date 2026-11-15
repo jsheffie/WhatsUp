@@ -54,3 +54,32 @@ Tip: keep your real config in a private dotfiles repo and symlink it to the user
 ## Config format
 
 See [`config/whatsup.json`](config/whatsup.json) for a working example. Each link is `{ "label", "url", "port"? }`; when `port` is omitted it is derived from the URL. `null` leaves a cell empty. `tone` (`gray` / `black`) alternates row shading.
+
+## Remote machines
+
+WhatsUp can also show the stacks of another machine on the same network, and open their pages in a dedicated Chrome profile that browses as if it were on that machine. Both machines can run the same stacks on the same ports at once.
+
+```json
+"machine_names": { "Jeffs-MacBook-Pro-2": "megan" },
+"remotes": [
+  { "name": "lucy", "ssh": "lucy", "browser_profile": "megan:Lucy" }
+]
+```
+
+- `remotes`: each entry mirrors every group for that machine, in its own sections with a machine tag and tab.
+  - `ssh` is a host from `~/.ssh/config` that logs in without a prompt.
+  - `browser_profile` is the display name of the Chrome profile that opens its links.
+  - `socks_port` is optional (default `47655`).
+- A row can carry `"machines": ["lucy"]` to show only on those machines (by label), for stacks that exist on one machine only. Rows without it show everywhere.
+- `machine_names`: optional labels for short hostnames (`hostname -s`). A remote whose `name` matches this machine's label is ignored, so one shared config works on every machine.
+
+How it works:
+
+- WhatsUp runs `ssh -N -D 127.0.0.1:<socks_port> <ssh>` for each remote and restarts it with backoff (1s up to 30s) when it drops. It stops when WhatsUp quits.
+- Status is checked through that tunnel: the remote machine itself connects to each link's host and port, so a link is green only when the page would load there. When the tunnel is down, the remote's links turn gray with an "offline" note.
+- Links open in the remote's Chrome profile. That profile sends all of its traffic through the tunnel, so host names like `jds4.local.me` and `localhost` resolve on the remote machine.
+
+One-time profile setup:
+
+1. Create a Chrome profile with the `browser_profile` name. It does not need to be signed in to Chrome.
+2. In that profile, open `chrome://extensions`, turn on Developer mode, choose Load unpacked, and pick `extension/remote-proxy` from this repo. If you change `socks_port`, change `SOCKS_PORT` in `extension/remote-proxy/background.js` to match.

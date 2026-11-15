@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "WhatsUp remote proxy",
+  "version": "1.0.0",
+  "description": "Sends this Chrome profile's traffic through WhatsUp's SSH tunnel to a remote machine (SOCKS5 127.0.0.1:47655).",
+  "permissions": ["proxy"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

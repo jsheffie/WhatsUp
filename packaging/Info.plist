@@ -24,5 +24,7 @@
   <true/>
   <key>NSAppleEventsUsageDescription</key>
   <string>WhatsUp opens service links in Google Chrome.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>WhatsUp connects to your other dev machines over SSH to show their services.</string>
 </dict>
 </plist>

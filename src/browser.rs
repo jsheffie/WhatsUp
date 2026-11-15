@@ -87,6 +87,87 @@ pub fn linux_launch(
     })
 }
 
+/// Opens `url` in the Chrome profile whose display name is `profile_name`.
+///
+/// AppleScript cannot pick a profile, so this launches Chrome with
+/// `--profile-directory`; a running Chrome takes the URL over.
+pub fn open_in_profile(app: &str, profile_name: &str, url: &str) -> Result<(), String> {
+    validate_text(app, "browser_app")?;
+    validate_text(profile_name, "browser_profile")?;
+    validate_text(url, "url")?;
+    let state_path = chrome_local_state_path().ok_or("could not find Chrome's Local State file")?;
+    let state = std::fs::read_to_string(&state_path)
+        .map_err(|err| format!("could not read {}: {err}", state_path.display()))?;
+    let dir = profile_dir_for_name(&state, profile_name)
+        .ok_or_else(|| format!("Chrome profile \"{profile_name}\" not found"))?;
+    spawn_detached(&platform_profile_launch(app, &dir, url)?)
+}
+
+/// The profile directory (`Default`, `Profile 7`, ...) whose display name is
+/// exactly `name`, from the JSON of Chrome's `Local State` file.
+pub fn profile_dir_for_name(local_state_json: &str, name: &str) -> Option<String> {
+    let state: serde_json::Value = serde_json::from_str(local_state_json).ok()?;
+    state
+        .get("profile")?
+        .get("info_cache")?
+        .as_object()?
+        .iter()
+        .find(|(_, info)| info.get("name").and_then(|value| value.as_str()) == Some(name))
+        .map(|(dir, _)| dir.clone())
+}
+
+pub fn chrome_local_state_path() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME").filter(|home| !home.is_empty())?);
+    let root = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/Google/Chrome")
+    } else {
+        home.join(".config/google-chrome")
+    };
+    Some(root.join("Local State"))
+}
+
+pub fn mac_profile_launch(app: &str, profile_dir: &str, url: &str) -> Launch {
+    Launch {
+        program: PathBuf::from("open"),
+        args: vec![
+            "-na".to_string(),
+            app.to_string(),
+            "--args".to_string(),
+            format!("--profile-directory={profile_dir}"),
+            url.to_string(),
+        ],
+    }
+}
+
+pub fn linux_profile_launch(
+    app: &str,
+    profile_dir: &str,
+    url: &str,
+    find: impl Fn(&str) -> Option<PathBuf>,
+) -> Option<Launch> {
+    let program = browser_commands(app).iter().find_map(|name| find(name))?;
+    Some(Launch {
+        program,
+        args: vec![
+            format!("--profile-directory={profile_dir}"),
+            url.to_string(),
+        ],
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn platform_profile_launch(app: &str, profile_dir: &str, url: &str) -> Result<Launch, String> {
+    Ok(mac_profile_launch(app, profile_dir, url))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_profile_launch(app: &str, profile_dir: &str, url: &str) -> Result<Launch, String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    linux_profile_launch(app, profile_dir, url, |name| find_executable(name, &dirs))
+        .ok_or_else(|| format!("could not find {app} to open {url}"))
+}
+
 /// Commands to try for `browser_app`, most specific first.
 pub fn browser_commands(app: &str) -> Vec<String> {
     let known: &[&str] = match app.trim().to_ascii_lowercase().as_str() {
@@ -126,7 +207,6 @@ fn find_executable(name: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 
 /// Start the browser in its own process group with no inherited stdio, so it
 /// outlives WhatsUp and a Ctrl-C in WhatsUp's terminal never reaches it.
-#[cfg(not(target_os = "macos"))]
 fn spawn_detached(launch: &Launch) -> Result<(), String> {
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
@@ -250,6 +330,55 @@ mod tests {
             linux_launch("firefox", "http://a:1", OpenMode::Tab, installed(&[])),
             None
         );
+    }
+
+    #[test]
+    fn finds_profile_dir_by_display_name() {
+        let state = r#"{"profile":{"info_cache":{"Default":{"name":"Jeff"},"Profile 7":{"name":"megan:Lucy"}}}}"#;
+        assert_eq!(
+            profile_dir_for_name(state, "megan:Lucy"),
+            Some("Profile 7".to_string())
+        );
+        assert_eq!(profile_dir_for_name(state, "megan:lucy"), None);
+        assert_eq!(profile_dir_for_name("not json", "megan:Lucy"), None);
+    }
+
+    #[test]
+    fn mac_profile_launch_hands_the_profile_to_chrome() {
+        let launch = mac_profile_launch("Google Chrome", "Profile 7", "http://jds4.local.me:3004");
+        assert_eq!(launch.program, PathBuf::from("open"));
+        assert_eq!(
+            launch.args,
+            [
+                "-na",
+                "Google Chrome",
+                "--args",
+                "--profile-directory=Profile 7",
+                "http://jds4.local.me:3004"
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_profile_launch_uses_the_browser_command() {
+        let find = installed(&["google-chrome-stable"]);
+        let launch =
+            linux_profile_launch("Google Chrome", "Profile 7", "http://a:1", &find).unwrap();
+        assert_eq!(
+            launch.program,
+            PathBuf::from("/usr/bin/google-chrome-stable")
+        );
+        assert_eq!(launch.args, ["--profile-directory=Profile 7", "http://a:1"]);
+        assert_eq!(
+            linux_profile_launch("Google Chrome", "P", "http://a:1", installed(&[])),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_profile_names_that_could_become_flags() {
+        assert!(open_in_profile("Google Chrome", "--x", "http://a:1").is_err());
+        assert!(open_in_profile("Google Chrome", "megan:Lucy", "--x").is_err());
     }
 
     #[test]
