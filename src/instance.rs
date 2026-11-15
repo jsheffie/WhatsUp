@@ -3,7 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::id;
 
-use crate::config::app_support_dir;
+use crate::config::runtime_dir;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Running {
@@ -26,7 +26,7 @@ impl Drop for InstanceLock {
 }
 
 pub fn instance_path() -> Result<PathBuf, String> {
-    let dir = app_support_dir()?;
+    let dir = runtime_dir()?;
     fs::create_dir_all(&dir).map_err(|err| format!("could not create {}: {err}", dir.display()))?;
     Ok(dir.join("instance.json"))
 }
@@ -90,7 +90,8 @@ fn write_record(file: &mut File, pid: u32, port: u16) -> Result<(), String> {
         .map_err(|err| format!("could not write instance file: {err}"))
 }
 
-fn process_alive(pid: u32) -> bool {
+/// True when `pid` names a live process (signal 0 checks without sending).
+pub fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
