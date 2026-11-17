@@ -64,6 +64,7 @@ pub fn is_our_tunnel(command: &str, socks_port: u16) -> bool {
         ssh: String::new(),
         browser_profile: String::new(),
         socks_port,
+        herdr_socket: None,
     });
     let args: Vec<&str> = words.collect();
     args.len() == expected.len()
@@ -305,6 +306,7 @@ mod tests {
             browser_profile: "megan:Lucy".into(),
             // Not the default port: tests must never touch a real tunnel.
             socks_port: 47695,
+            herdr_socket: None,
         }
     }
 

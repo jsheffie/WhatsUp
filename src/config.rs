@@ -31,6 +31,8 @@ pub struct Remote {
     pub ssh: String,
     pub browser_profile: String,
     pub socks_port: u16,
+    /// Absolute path of the remote's herdr socket, forwarded over the tunnel.
+    pub herdr_socket: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +72,15 @@ pub enum Cell {
     Empty,
     Text(String),
     Link(Link),
+    /// Text followed by the labels of the machine's herdr workspaces whose
+    /// names start with `prefix`.
+    Herdr(HerdrCell),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrCell {
+    pub text: String,
+    pub prefix: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +122,16 @@ impl DashboardConfig {
                 Cell::Link(link) => Some(link),
                 _ => None,
             })
+    }
+
+    /// Whether any row shown on `machine` has a herdr cell.
+    pub fn has_herdr_cells_on(&self, machine: &str) -> bool {
+        self.groups
+            .iter()
+            .flat_map(|group| group.rows.iter())
+            .filter(|row| row.shown_on(machine))
+            .flat_map(|row| row.cells.iter())
+            .any(|cell| matches!(cell, Cell::Herdr(_)))
     }
 
     pub fn allows_url_on(&self, url: &str, machine: &str) -> bool {
@@ -296,6 +317,8 @@ struct RawRemote {
     browser_profile: String,
     #[serde(default)]
     socks_port: Option<u16>,
+    #[serde(default)]
+    herdr_socket: Option<String>,
 }
 
 impl RawRemote {
@@ -323,11 +346,24 @@ impl RawRemote {
                 crate::PREFERRED_PORT
             ));
         }
+        if let Some(socket) = &self.herdr_socket {
+            // It becomes the remote half of an ssh `-L local:remote` forward.
+            if !socket.starts_with('/')
+                || socket
+                    .chars()
+                    .any(|ch| ch == ':' || ch.is_whitespace() || ch.is_control())
+            {
+                return Err(format!(
+                    "{at} herdr_socket must be an absolute path without ':' or spaces"
+                ));
+            }
+        }
         Ok(Remote {
             name: self.name,
             ssh: self.ssh,
             browser_profile: self.browser_profile,
             socks_port,
+            herdr_socket: self.herdr_socket,
         })
     }
 }
@@ -481,6 +517,7 @@ fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result
                 Ok(Cell::Text(text))
             }
         }
+        Value::Object(map) if map.contains_key("text") => parse_herdr_cell(&map, &at),
         Value::Object(map) => {
             let label = required_string(&map, "label", &at)?;
             let url = required_string(&map, "url", &at)?;
@@ -516,6 +553,29 @@ fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result
         }
         _ => Err(format!("{at} must be a string, a link, or null")),
     }
+}
+
+fn parse_herdr_cell(map: &serde_json::Map<String, Value>, at: &str) -> Result<Cell, String> {
+    for key in map.keys() {
+        if !["text", "herdr"].contains(&key.as_str()) {
+            return Err(format!("{at} has unknown field {key}"));
+        }
+    }
+    let text = required_string(map, "text", at)?;
+    let prefix = required_string(map, "herdr", at)?;
+    if text.trim().is_empty() {
+        return Err(format!("{at} text is empty"));
+    }
+    if prefix.is_empty()
+        || prefix
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(format!(
+            "{at} herdr must be a workspace name prefix without spaces"
+        ));
+    }
+    Ok(Cell::Herdr(HerdrCell { text, prefix }))
 }
 
 fn required_string(
@@ -639,6 +699,96 @@ mod tests {
         )
     }
 
+    fn with_cells(cells: &str) -> String {
+        format!(
+            r#"{{
+                "groups": [{{
+                    "id": "g",
+                    "label": "G",
+                    "columns": ["Workspace"],
+                    "rows": [{{ "cells": [{cells}] }}]
+                }}]
+            }}"#
+        )
+    }
+
+    #[test]
+    fn herdr_cell_parses() {
+        let config = parse_config(&with_cells(r#"{ "text": "jds", "herdr": "h1" }"#)).unwrap();
+        assert_eq!(
+            config.groups[0].rows[0].cells[0],
+            Cell::Herdr(HerdrCell {
+                text: "jds".into(),
+                prefix: "h1".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn herdr_cell_rejects_blank_or_unknown() {
+        let bad = [
+            r#"{ "text": " ", "herdr": "h1" }"#,
+            r#"{ "text": "jds", "herdr": "" }"#,
+            r#"{ "text": "jds", "herdr": "h 1" }"#,
+            r#"{ "text": "jds", "herdr": "h1", "x": 1 }"#,
+            r#"{ "text": "jds" }"#,
+        ];
+        for cell in bad {
+            let error = parse_config(&with_cells(cell)).expect_err(cell);
+            assert!(error.contains("group g row 0 column 0"), "{cell}: {error}");
+        }
+    }
+
+    #[test]
+    fn remote_herdr_socket_must_be_absolute() {
+        let remote = |extra: &str| {
+            with_top_level(&format!(
+                r#""remotes": [{{ "name": "lucy", "ssh": "lucy", "browser_profile": "P"{extra} }}],"#
+            ))
+        };
+        assert_eq!(
+            parse_config(&remote("")).unwrap().remotes[0].herdr_socket,
+            None
+        );
+        assert_eq!(
+            parse_config(&remote(
+                r#", "herdr_socket": "/home/jds/.config/herdr/herdr.sock""#
+            ))
+            .unwrap()
+            .remotes[0]
+                .herdr_socket
+                .as_deref(),
+            Some("/home/jds/.config/herdr/herdr.sock")
+        );
+        for bad in [
+            r#", "herdr_socket": ".config/herdr/herdr.sock""#,
+            r#", "herdr_socket": "/home/a:b.sock""#,
+            r#", "herdr_socket": "/home/a b.sock""#,
+        ] {
+            assert!(parse_config(&remote(bad)).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn has_herdr_cells_on_respects_row_machines() {
+        let config = parse_config(
+            r#"{
+                "groups": [{
+                    "id": "g",
+                    "label": "G",
+                    "columns": ["Workspace"],
+                    "rows": [
+                        { "machines": ["lucy"], "cells": [{ "text": "jds7", "herdr": "h7" }] },
+                        { "cells": ["plain"] }
+                    ]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert!(config.has_herdr_cells_on("lucy"));
+        assert!(!config.has_herdr_cells_on("megan"));
+    }
+
     #[test]
     fn parses_remotes_with_defaults() {
         let config = parse_config(&with_top_level(
@@ -652,6 +802,7 @@ mod tests {
                 ssh: "lucy".into(),
                 browser_profile: "megan:Lucy".into(),
                 socks_port: 47655,
+                herdr_socket: None,
             }]
         );
         assert_eq!(DEFAULT_SOCKS_PORT, 47655);

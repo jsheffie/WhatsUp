@@ -308,6 +308,7 @@ fn group_view(group: &Group, machine: &MachineStatus) -> Value {
                 "cells": row.cells.iter().map(|cell| match cell {
                     Cell::Empty => json!({ "type": "empty" }),
                     Cell::Text(text) => json!({ "type": "text", "text": text }),
+                    Cell::Herdr(cell) => json!({ "type": "text", "text": cell.text }),
                     Cell::Link(link) => json!({
                         "type": "link",
                         "label": link.label,
