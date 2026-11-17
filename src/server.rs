@@ -153,9 +153,8 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
     // by QUERY_BUDGET and any failure just means no labels.
     let query_herdr = |machine: &str, socket: Option<std::path::PathBuf>| {
         let socket = socket.filter(|_| config.has_herdr_cells_on(machine));
-        socket.map(|socket| {
-            tokio::task::spawn_blocking(move || list_workspaces(&socket, QUERY_BUDGET))
-        })
+        socket
+            .map(|socket| tokio::spawn(async move { list_workspaces(&socket, QUERY_BUDGET).await }))
     };
     let local_herdr = query_herdr(&local, state.inner.local_herdr.clone());
     let remote_herdr: Vec<_> = remotes

@@ -2,10 +2,11 @@
 //! matches workspace labels to dashboard cells by name prefix.
 
 use std::ffi::OsString;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 
 use serde::Deserialize;
 
@@ -67,22 +68,22 @@ pub fn parse_reply(line: &str) -> Option<Vec<HerdrWorkspace>> {
 }
 
 /// Asks the herdr server on `socket` for its workspaces. `None` when there
-/// is no server, it fails, or it does not answer within `budget`.
-pub fn list_workspaces(socket: &Path, budget: Duration) -> Option<Vec<HerdrWorkspace>> {
-    let deadline = Instant::now() + budget;
-    let remaining = || {
-        deadline
-            .checked_duration_since(Instant::now())
-            .filter(|left| !left.is_zero())
-    };
-    let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_write_timeout(Some(remaining()?)).ok()?;
-    stream.write_all(REQUEST).ok()?;
+/// is no server, it fails, or the whole exchange (connect included: a herdr
+/// that stops accepting blocks connects on Linux) takes longer than `budget`.
+pub async fn list_workspaces(socket: &Path, budget: Duration) -> Option<Vec<HerdrWorkspace>> {
+    tokio::time::timeout(budget, exchange(socket))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn exchange(socket: &Path) -> Option<Vec<HerdrWorkspace>> {
+    let mut stream = UnixStream::connect(socket).await.ok()?;
+    stream.write_all(REQUEST).await.ok()?;
     let mut reply = Vec::new();
     let mut chunk = [0u8; 8192];
     loop {
-        stream.set_read_timeout(Some(remaining()?)).ok()?;
-        let read = stream.read(&mut chunk).ok()?;
+        let read = stream.read(&mut chunk).await.ok()?;
         if read == 0 {
             return None;
         }
@@ -159,7 +160,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     const FIXTURE: &str = r#"{"id":"whatsup","result":{"type":"workspace_list","workspaces":[{"workspace_id":"w1","number":2,"label":"h1","focused":false,"pane_count":1,"agent_status":"unknown","future_field":1}]}}"#;
 
@@ -244,8 +245,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn list_workspaces_round_trip() {
+    #[tokio::test]
+    async fn list_workspaces_round_trip() {
         let (sent_tx, sent_rx) = std::sync::mpsc::channel();
         let path = fake_herdr(move |stream| {
             let mut line = String::new();
@@ -256,7 +257,7 @@ mod tests {
                 .unwrap();
         });
         assert_eq!(
-            list_workspaces(&path, QUERY_BUDGET),
+            list_workspaces(&path, QUERY_BUDGET).await,
             Some(vec![ws(2, "h1")])
         );
         assert_eq!(
@@ -266,30 +267,90 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn list_workspaces_eof_is_fast_none() {
+    #[tokio::test]
+    async fn list_workspaces_eof_is_fast_none() {
         let path = fake_herdr(drop);
         let started = Instant::now();
-        assert_eq!(list_workspaces(&path, QUERY_BUDGET), None);
+        assert_eq!(list_workspaces(&path, QUERY_BUDGET).await, None);
         assert!(started.elapsed() < Duration::from_millis(200));
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn list_workspaces_silent_server_times_out() {
+    #[tokio::test]
+    async fn list_workspaces_silent_server_times_out() {
         let path = fake_herdr(|stream| {
             std::thread::sleep(Duration::from_secs(2));
             drop(stream);
         });
         let started = Instant::now();
-        assert_eq!(list_workspaces(&path, Duration::from_millis(300)), None);
+        assert_eq!(
+            list_workspaces(&path, Duration::from_millis(300)).await,
+            None
+        );
         assert!(started.elapsed() < Duration::from_millis(600));
         let _ = std::fs::remove_file(path);
     }
 
+    /// A listener that queues at most one connection and never accepts.
+    fn tiny_backlog_listener(path: &std::path::Path) -> UnixListener {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd >= 0);
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            for (slot, byte) in addr.sun_path.iter_mut().zip(path.as_os_str().as_bytes()) {
+                *slot = *byte as libc::c_char;
+            }
+            let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            assert_eq!(
+                libc::bind(fd, &addr as *const _ as *const libc::sockaddr, len),
+                0
+            );
+            assert_eq!(libc::listen(fd, 0), 0);
+            UnixListener::from_raw_fd(fd)
+        }
+    }
+
     #[test]
-    fn list_workspaces_missing_socket_is_none() {
-        assert_eq!(list_workspaces(&socket_path(), QUERY_BUDGET), None);
+    fn list_workspaces_full_accept_queue_times_out() {
+        // A herdr that never accepts: once its accept queue is full, a
+        // blocking connect waits forever on Linux (macOS refuses at once).
+        let path = socket_path();
+        let listener = tiny_backlog_listener(&path);
+        for _ in 0..4 {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let held = std::os::unix::net::UnixStream::connect(path);
+                std::thread::sleep(Duration::from_secs(30));
+                drop(held);
+            });
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let started = Instant::now();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let query = path.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(list_workspaces(&query, Duration::from_millis(300)));
+            let _ = done_tx.send(result);
+        });
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("list_workspaces hung on a full accept queue");
+        assert_eq!(result, None);
+        assert!(started.elapsed() < Duration::from_millis(600));
+        drop(listener);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn list_workspaces_missing_socket_is_none() {
+        assert_eq!(list_workspaces(&socket_path(), QUERY_BUDGET).await, None);
     }
 
     #[test]
