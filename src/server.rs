@@ -13,6 +13,7 @@ use tokio::sync::watch;
 
 use crate::browser::{open_in_browser, open_in_profile, OpenMode};
 use crate::config::{config_mtime, load_config, Cell, DashboardConfig, Group, Link, Tone};
+use crate::herdr::{list_workspaces, matching_labels, HerdrWorkspace, QUERY_BUDGET};
 use crate::probe::probe_ports;
 use crate::socks::{probe_remote, Reach};
 use crate::tunnel::{TunnelState, Tunnels};
@@ -46,6 +47,8 @@ struct Inner {
     /// into the label shown on the dashboard.
     hostname: String,
     tunnels: Arc<Tunnels>,
+    /// This machine's herdr socket, if herdr labels can be read here.
+    local_herdr: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone)]
@@ -61,6 +64,7 @@ impl AppState {
         shutdown: watch::Sender<bool>,
         hostname: String,
         tunnels: Arc<Tunnels>,
+        local_herdr: Option<std::path::PathBuf>,
     ) -> Self {
         let mtime = config_mtime(&config_path);
         tunnels.reconcile(&config.active_remotes(&config.machine_label(&hostname)));
@@ -74,6 +78,7 @@ impl AppState {
                 shutdown,
                 hostname,
                 tunnels,
+                local_herdr,
             }),
         }
     }
@@ -144,6 +149,19 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
             tokio::task::spawn_blocking(move || probe_remote(socks_port, targets))
         })
         .collect();
+    // herdr workspace lists, queried alongside the probes; each is bounded
+    // by QUERY_BUDGET and any failure just means no labels.
+    let query_herdr = |machine: &str, socket: Option<std::path::PathBuf>| {
+        let socket = socket.filter(|_| config.has_herdr_cells_on(machine));
+        socket.map(|socket| {
+            tokio::task::spawn_blocking(move || list_workspaces(&socket, QUERY_BUDGET))
+        })
+    };
+    let local_herdr = query_herdr(&local, state.inner.local_herdr.clone());
+    let remote_herdr: Vec<_> = remotes
+        .iter()
+        .map(|remote| query_herdr(&remote.name, state.inner.tunnels.herdr_socket(&remote.name)))
+        .collect();
     let local_status = local_probe.await.expect("port probe");
     let mut machines = vec![MachineStatus {
         name: local,
@@ -152,9 +170,10 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         note: None,
         up: Box::new(move |link: &Link| local_status.get(&link.port).copied().unwrap_or(false)),
         counts: (0, 0),
+        herdr: herdr_result(local_herdr).await,
     }];
     machines[0].counts = count_local(&config, &machines[0]);
-    for (remote, probe) in remotes.iter().zip(remote_probes) {
+    for ((remote, probe), herdr) in remotes.iter().zip(remote_probes).zip(remote_herdr) {
         let reach = probe.await.expect("remote probe");
         let offline = reach.values().any(|reach| *reach == Reach::Offline);
         let tunnel_error = match state.inner.tunnels.state(&remote.name) {
@@ -186,6 +205,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
                 !offline && reach.get(&(link.host.clone(), link.port)) == Some(&Reach::Up)
             }),
             counts,
+            herdr: herdr_result(herdr).await,
         });
     }
     Json(view(&config, &machines, &path, error))
@@ -200,6 +220,14 @@ struct MachineStatus {
     note: Option<String>,
     up: Box<dyn Fn(&Link) -> bool + Send>,
     counts: (usize, usize),
+    /// The machine's herdr workspaces, when they could be read.
+    herdr: Option<Vec<HerdrWorkspace>>,
+}
+
+async fn herdr_result(
+    query: Option<tokio::task::JoinHandle<Option<Vec<HerdrWorkspace>>>>,
+) -> Option<Vec<HerdrWorkspace>> {
+    query?.await.ok().flatten()
 }
 
 /// Local status is per port, as before: distinct ports, and how many are up.
@@ -308,7 +336,18 @@ fn group_view(group: &Group, machine: &MachineStatus) -> Value {
                 "cells": row.cells.iter().map(|cell| match cell {
                     Cell::Empty => json!({ "type": "empty" }),
                     Cell::Text(text) => json!({ "type": "text", "text": text }),
-                    Cell::Herdr(cell) => json!({ "type": "text", "text": cell.text }),
+                    Cell::Herdr(cell) => {
+                        let labels = machine
+                            .herdr
+                            .as_deref()
+                            .map(|workspaces| matching_labels(workspaces, &cell.prefix))
+                            .unwrap_or_default();
+                        if labels.is_empty() {
+                            json!({ "type": "text", "text": cell.text })
+                        } else {
+                            json!({ "type": "text", "text": cell.text, "herdr": labels })
+                        }
+                    }
                     Cell::Link(link) => json!({
                         "type": "link",
                         "label": link.label,
@@ -335,6 +374,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener as StdListener, TcpStream};
     use std::path::PathBuf;
+    use std::time::Duration;
 
     struct Recording(Mutex<Vec<String>>);
 
@@ -368,6 +408,18 @@ mod tests {
         config_json: &str,
         program: PathBuf,
     ) -> (SocketAddr, Arc<Recording>, PathBuf) {
+        serve_herdr(name, config_json, program, std::env::temp_dir(), None).await
+    }
+
+    /// Like `serve_with`, with herdr forwards bound in `socket_dir` and the
+    /// local herdr at `local_herdr`.
+    async fn serve_herdr(
+        name: &str,
+        config_json: &str,
+        program: PathBuf,
+        socket_dir: PathBuf,
+        local_herdr: Option<PathBuf>,
+    ) -> (SocketAddr, Arc<Recording>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("whatsup-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -376,7 +428,7 @@ mod tests {
         let config = load_config(&config_path).unwrap();
         let (shutdown, _rx) = watch::channel(false);
         let opener = Arc::new(Recording(Mutex::new(Vec::new())));
-        let tunnels = Arc::new(Tunnels::new(program, std::env::temp_dir()));
+        let tunnels = Arc::new(Tunnels::new(program, socket_dir));
         let state = AppState::new(
             config_path,
             config,
@@ -384,6 +436,7 @@ mod tests {
             shutdown,
             HOSTNAME.to_string(),
             tunnels,
+            local_herdr,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -410,6 +463,160 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn herdr_config(remote: &str) -> String {
+        format!(
+            r#"{{
+                {remote}
+                "groups": [{{
+                    "id": "g",
+                    "label": "Stacks",
+                    "columns": ["Workspace", "Portal"],
+                    "rows": [{{
+                        "cells": [
+                            {{ "text": "jds", "herdr": "h1" }},
+                            {{ "label": "portal", "url": "http://localhost:1/" }}
+                        ]
+                    }}]
+                }}]
+            }}"#
+        )
+    }
+
+    /// A short socket path in the temp dir (macOS limits them to ~104 bytes).
+    fn herdr_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("wu-{name}-{}.sock", std::process::id()))
+    }
+
+    fn workspace_cell(json: &Value, section: usize) -> Value {
+        json["groups"][section]["rows"][0]["cells"][0].clone()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_herdr_label_in_workspace_cell() {
+        let socket = herdr_path("local");
+        crate::herdr::testing::serve_labels(&socket, &[(3, "h10-e2e-testing"), (2, "h1-herberth")]);
+        let (_, program) = crate::tunnel::testing::running_stub("server-herdr-local");
+        let (addr, _opener, dir) = serve_herdr(
+            "herdr-local",
+            &herdr_config(""),
+            program,
+            std::env::temp_dir(),
+            Some(socket.clone()),
+        )
+        .await;
+        assert_eq!(
+            workspace_cell(&dashboard_json(addr).await, 0),
+            json!({ "type": "text", "text": "jds", "herdr": ["h1-herberth"] })
+        );
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_herdr_socket_gives_plain_text() {
+        let (addr, _opener, dir) = serve("herdr-none", &herdr_config("")).await;
+        assert_eq!(
+            workspace_cell(&dashboard_json(addr).await, 0),
+            json!({ "type": "text", "text": "jds" })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn herdr_down_does_not_delay_dashboard() {
+        let socket = herdr_path("silent");
+        crate::herdr::testing::serve_silence(&socket);
+        let (_, program) = crate::tunnel::testing::running_stub("server-herdr-silent");
+        let (addr, _opener, dir) = serve_herdr(
+            "herdr-silent",
+            &herdr_config(""),
+            program,
+            std::env::temp_dir(),
+            Some(socket.clone()),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let json = dashboard_json(addr).await;
+        assert!(started.elapsed() < crate::herdr::QUERY_BUDGET + Duration::from_millis(500));
+        assert_eq!(
+            workspace_cell(&json, 0),
+            json!({ "type": "text", "text": "jds" })
+        );
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn lucy_with_herdr(socks_port: u16) -> String {
+        format!(
+            r#""remotes": [{{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "socks_port": {socks_port}, "herdr_socket": "/home/jds/.config/herdr/herdr.sock" }}],"#
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_herdr_label_through_forward() {
+        let (stub_dir, program) = crate::tunnel::testing::running_stub("hr");
+        let socks_port = 47697;
+        crate::herdr::testing::serve_labels(
+            &stub_dir.join(format!("herdr-{socks_port}.sock")),
+            &[(2, "h1-remote")],
+        );
+        let (addr, _opener, dir) = serve_herdr(
+            "herdr-remote",
+            &herdr_config(&lucy_with_herdr(socks_port)),
+            program,
+            stub_dir.clone(),
+            None,
+        )
+        .await;
+        // The tunnel stub needs a moment to count as running.
+        let mut json = dashboard_json(addr).await;
+        for _ in 0..20 {
+            if json["groups"][1]["rows"][0]["cells"][0]["herdr"].is_array() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            json = dashboard_json(addr).await;
+        }
+        assert_eq!(json["groups"][1]["machine"], "lucy");
+        assert_eq!(
+            workspace_cell(&json, 1),
+            json!({ "type": "text", "text": "jds", "herdr": ["h1-remote"] })
+        );
+        assert_eq!(
+            workspace_cell(&json, 0),
+            json!({ "type": "text", "text": "jds" })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(stub_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remote_cells_plain_while_tunnel_not_running() {
+        let (stub_dir, program) = crate::tunnel::testing::stub("hd", "exit 1");
+        let socks_port = 47698;
+        crate::herdr::testing::serve_labels(
+            &stub_dir.join(format!("herdr-{socks_port}.sock")),
+            &[(2, "h1-stale")],
+        );
+        let (addr, _opener, dir) = serve_herdr(
+            "herdr-down",
+            &herdr_config(&lucy_with_herdr(socks_port)),
+            program,
+            stub_dir.clone(),
+            None,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let json = dashboard_json(addr).await;
+        assert_eq!(json["groups"][1]["machine"], "lucy");
+        assert_eq!(
+            workspace_cell(&json, 1),
+            json!({ "type": "text", "text": "jds" })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(stub_dir);
     }
 
     async fn dashboard_json(addr: SocketAddr) -> Value {
@@ -680,6 +887,7 @@ mod tests {
             shutdown,
             HOSTNAME.to_string(),
             Arc::new(Tunnels::new(PathBuf::from("true"), std::env::temp_dir())),
+            None,
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

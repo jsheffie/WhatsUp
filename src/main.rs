@@ -93,6 +93,7 @@ fn run() -> Result<(), String> {
             shutdown_tx,
             short_hostname(),
             tunnels.clone(),
+            whatsup::herdr::local_socket(&|key| env::var_os(key)),
         );
         let app = router(state);
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {

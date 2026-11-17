@@ -109,6 +109,51 @@ pub fn local_socket(env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
+pub(crate) mod testing {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::path::Path;
+
+    /// A herdr server on `path` answering every `workspace.list` with
+    /// `workspaces` (number, label). Runs for the rest of the test process.
+    pub fn serve_labels(path: &Path, workspaces: &[(u64, &str)]) {
+        let list: Vec<_> = workspaces
+            .iter()
+            .map(|(number, label)| {
+                serde_json::json!({ "workspace_id": format!("w{number}"), "number": number, "label": label })
+            })
+            .collect();
+        let reply = serde_json::json!({
+            "id": "whatsup",
+            "result": { "type": "workspace_list", "workspaces": list },
+        })
+        .to_string();
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut line = String::new();
+                if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                    let _ = (&stream).write_all(format!("{reply}\n").as_bytes());
+                }
+            }
+        });
+    }
+
+    /// A herdr server on `path` that accepts and never answers.
+    pub fn serve_silence(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let listener = UnixListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
