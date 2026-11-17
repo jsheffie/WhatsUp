@@ -83,3 +83,17 @@ One-time profile setup:
 
 1. Create a Chrome profile with the `browser_profile` name. It does not need to be signed in to Chrome.
 2. In that profile, open `chrome://extensions`, turn on Developer mode, choose Load unpacked, and pick `extension/remote-proxy` from this repo. If you change `socks_port`, change `SOCKS_PORT` in `extension/remote-proxy/background.js` to match.
+
+## herdr workspace labels
+
+When a stack runs in its own herdr workspace, the dashboard can show that workspace's name next to the stack: the Workspace cell `jds` reads `jds/h1-herberth`.
+
+```json
+{ "text": "jds", "herdr": "h1" }
+```
+
+- Use this cell form in place of a plain text cell. `herdr` is a prefix: it matches a herdr workspace whose label is `h1`, or starts with `h1` followed by a separator (`h1-herberth`, `h1 x`). `h10-...` does not match. Case is ignored.
+- Each machine's section uses that machine's herdr (its default session). With several matches, the cell shows the first one in herdr's sidebar order plus `+N`, and the tooltip lists them all.
+- On this machine WhatsUp reads `$XDG_CONFIG_HOME/herdr/herdr.sock`, else `~/.config/herdr/herdr.sock`.
+- For a remote, add `"herdr_socket": "/home/<user>/.config/herdr/herdr.sock"` (absolute) to its entry. WhatsUp forwards that socket over the remote's tunnel to `herdr-<socks_port>.sock` in its own directory.
+- WhatsUp only ever sends herdr's read-only `workspace.list` request. If herdr is not running or does not answer within a second, the cell shows its plain text.

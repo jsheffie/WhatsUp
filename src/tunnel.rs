@@ -6,7 +6,7 @@
 //! offline.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,7 +22,36 @@ const MAX_DELAY: Duration = Duration::from_secs(30);
 /// A run at least this long counts as healthy and resets the backoff.
 const HEALTHY_RUN: Duration = Duration::from_secs(60);
 
-pub fn ssh_args(remote: &Remote) -> Vec<String> {
+/// Local socket paths at least this long cannot be bound on macOS
+/// (`sun_path` is 104 bytes), and a forward that cannot bind would take the
+/// whole tunnel down (`ExitOnForwardFailure`).
+const MAX_SOCKET_PATH: usize = 100;
+
+/// Where the remote's herdr socket is forwarded to on this machine, if the
+/// remote has one and the path is short enough to bind.
+pub fn herdr_forward_path(socket_dir: &Path, remote: &Remote) -> Option<PathBuf> {
+    remote.herdr_socket.as_ref()?;
+    let path = socket_dir.join(format!("herdr-{}.sock", remote.socks_port));
+    (path.as_os_str().len() < MAX_SOCKET_PATH).then_some(path)
+}
+
+/// The ssh arguments for `remote`'s tunnel; `forward` is the local end of
+/// the herdr socket forward (see [`herdr_forward_path`]).
+pub fn ssh_args(remote: &Remote, forward: Option<&Path>) -> Vec<String> {
+    let mut args = base_args(remote);
+    if let (Some(local), Some(remote_socket)) = (forward, &remote.herdr_socket) {
+        args.extend([
+            "-o".to_string(),
+            "StreamLocalBindUnlink=yes".to_string(),
+            "-L".to_string(),
+            format!("{}:{remote_socket}", local.display()),
+        ]);
+    }
+    args.push(remote.ssh.clone());
+    args
+}
+
+fn base_args(remote: &Remote) -> Vec<String> {
     [
         "-N".to_string(),
         "-D".to_string(),
@@ -35,7 +64,6 @@ pub fn ssh_args(remote: &Remote) -> Vec<String> {
         "ServerAliveInterval=5".to_string(),
         "-o".to_string(),
         "ServerAliveCountMax=2".to_string(),
-        remote.ssh.clone(),
     ]
     .into()
 }
@@ -52,25 +80,39 @@ pub fn is_probe_noise(line: &str) -> bool {
 /// started on `socks_port`, to any host. A WhatsUp that was force-quit leaves
 /// its ssh running, holding the port.
 pub fn is_our_tunnel(command: &str, socks_port: u16) -> bool {
-    let mut words = command.split_whitespace();
-    let Some(program) = words.next() else {
+    let Some((program, rest)) = command.split_once(char::is_whitespace) else {
         return false;
     };
     if program != "ssh" && !program.ends_with("/ssh") {
         return false;
     }
-    let expected = ssh_args(&Remote {
+    let base = base_args(&Remote {
         name: String::new(),
         ssh: String::new(),
         browser_profile: String::new(),
         socks_port,
-    });
-    let args: Vec<&str> = words.collect();
-    args.len() == expected.len()
-        && args
-            .iter()
-            .zip(&expected[..expected.len() - 1])
-            .all(|(arg, want)| arg == want)
+        herdr_socket: None,
+    })
+    .join(" ");
+    let Some(tail) = rest
+        .trim()
+        .strip_prefix(&base)
+        .and_then(|tail| tail.strip_prefix(' '))
+    else {
+        return false;
+    };
+    let is_host = |word: &str| !word.is_empty() && !word.contains(char::is_whitespace);
+    if is_host(tail) {
+        return true;
+    }
+    // The herdr forward's local path may contain spaces ("Application
+    // Support"), so it is matched by shape, not split into words.
+    let Some(forward) = tail.strip_prefix("-o StreamLocalBindUnlink=yes -L ") else {
+        return false;
+    };
+    forward.rsplit_once(' ').is_some_and(|(spec, host)| {
+        is_host(host) && spec.contains(&format!("/herdr-{socks_port}.sock:/"))
+    })
 }
 
 /// Stops a tunnel of ours that a force-quit WhatsUp left listening on
@@ -137,14 +179,17 @@ struct Entry {
 
 pub struct Tunnels {
     program: PathBuf,
+    /// Where herdr socket forwards are bound (WhatsUp's runtime dir).
+    socket_dir: PathBuf,
     entries: Mutex<BTreeMap<String, Entry>>,
 }
 
 impl Tunnels {
     /// `program` is `ssh` in production.
-    pub fn new(program: PathBuf) -> Self {
+    pub fn new(program: PathBuf, socket_dir: PathBuf) -> Self {
         Self {
             program,
+            socket_dir,
             entries: Mutex::new(BTreeMap::new()),
         }
     }
@@ -158,6 +203,9 @@ impl Tunnels {
             let keep = remotes.contains(&entry.remote);
             if !keep {
                 entry.task.abort();
+                if let Some(path) = herdr_forward_path(&self.socket_dir, &entry.remote) {
+                    let _ = std::fs::remove_file(path);
+                }
             }
             keep
         });
@@ -165,10 +213,19 @@ impl Tunnels {
             if entries.contains_key(&remote.name) {
                 continue;
             }
+            let forward = herdr_forward_path(&self.socket_dir, remote);
+            if remote.herdr_socket.is_some() && forward.is_none() {
+                eprintln!(
+                    "{}: not forwarding herdr, the socket path in {} is too long",
+                    remote.name,
+                    self.socket_dir.display()
+                );
+            }
             let state = Arc::new(Mutex::new(TunnelState::Starting));
             let task = tokio::runtime::Handle::current().spawn(supervise(
                 self.program.clone(),
                 remote.clone(),
+                forward,
                 state.clone(),
             ));
             entries.insert(
@@ -189,6 +246,16 @@ impl Tunnels {
             .map(|entry| entry.state.lock().expect("state lock").clone())
     }
 
+    /// The local end of `name`'s herdr socket forward, while its tunnel runs.
+    pub fn herdr_socket(&self, name: &str) -> Option<PathBuf> {
+        let entries = self.entries.lock().expect("tunnels lock");
+        let entry = entries.get(name)?;
+        if *entry.state.lock().expect("state lock") != TunnelState::Running {
+            return None;
+        }
+        herdr_forward_path(&self.socket_dir, &entry.remote)
+    }
+
     /// Stops every tunnel.
     pub fn shutdown(&self) {
         self.reconcile(&[]);
@@ -205,7 +272,12 @@ impl Drop for Tunnels {
     }
 }
 
-async fn supervise(program: PathBuf, remote: Remote, state: Arc<Mutex<TunnelState>>) {
+async fn supervise(
+    program: PathBuf,
+    remote: Remote,
+    forward: Option<PathBuf>,
+    state: Arc<Mutex<TunnelState>>,
+) {
     let set = |next: TunnelState| *state.lock().expect("state lock") = next;
     let mut backoff = Backoff::new();
     loop {
@@ -214,7 +286,7 @@ async fn supervise(program: PathBuf, remote: Remote, state: Arc<Mutex<TunnelStat
         let _ = tokio::task::spawn_blocking(move || reclaim_port(port)).await;
         let started = Instant::now();
         let spawned = Command::new(&program)
-            .args(ssh_args(&remote))
+            .args(ssh_args(&remote, forward.as_deref()))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -305,16 +377,20 @@ mod tests {
             browser_profile: "megan:Lucy".into(),
             // Not the default port: tests must never touch a real tunnel.
             socks_port: 47695,
+            herdr_socket: None,
         }
     }
 
     #[test]
     fn ssh_args_match_the_spec() {
         assert_eq!(
-            ssh_args(&Remote {
-                socks_port: 47655,
-                ..lucy()
-            }),
+            ssh_args(
+                &Remote {
+                    socks_port: 47655,
+                    ..lucy()
+                },
+                None
+            ),
             [
                 "-N",
                 "-D",
@@ -381,7 +457,7 @@ mod tests {
             "reconcile",
             "echo $$ > \"$(dirname \"$0\")/$last.pid\"\nexec sleep 30",
         );
-        let tunnels = Tunnels::new(script);
+        let tunnels = Tunnels::new(script, dir.clone());
         tunnels.reconcile(&[lucy()]);
         let pid_file = dir.join("lucy.pid");
         assert!(
@@ -404,7 +480,7 @@ mod tests {
             "restart",
             "echo $$ > \"$(dirname \"$0\")/$last.pid\"\nexec sleep 30",
         );
-        let tunnels = Tunnels::new(script);
+        let tunnels = Tunnels::new(script, dir.clone());
         tunnels.reconcile(&[lucy()]);
         let pid_file = dir.join("lucy.pid");
         assert!(wait_for(|| read(&pid_file).is_some()).await);
@@ -419,6 +495,97 @@ mod tests {
         tunnels.shutdown();
         let second = read(&pid_file).unwrap();
         assert!(wait_for(|| !alive(&second)).await);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn lucy_with_herdr() -> Remote {
+        Remote {
+            herdr_socket: Some("/home/jds/.config/herdr/herdr.sock".into()),
+            ..lucy()
+        }
+    }
+
+    #[test]
+    fn ssh_args_with_forward() {
+        let local = Path::new("/Users/jds/Library/Application Support/WhatsUp/herdr-47695.sock");
+        let with = ssh_args(&lucy_with_herdr(), Some(local));
+        let mut want = ssh_args(&lucy(), None);
+        let host = want.pop().unwrap();
+        want.extend([
+            "-o".to_string(),
+            "StreamLocalBindUnlink=yes".to_string(),
+            "-L".to_string(),
+            format!("{}:/home/jds/.config/herdr/herdr.sock", local.display()),
+            host,
+        ]);
+        assert_eq!(with, want);
+        // A remote without a herdr socket gets no forward even if asked.
+        assert_eq!(ssh_args(&lucy(), Some(local)), ssh_args(&lucy(), None));
+    }
+
+    #[test]
+    fn forward_path_needs_socket_and_short_dir() {
+        let dir = Path::new("/Users/jds/Library/Application Support/WhatsUp");
+        assert_eq!(
+            herdr_forward_path(dir, &lucy_with_herdr()),
+            Some(dir.join("herdr-47695.sock"))
+        );
+        assert_eq!(herdr_forward_path(dir, &lucy()), None);
+        let long = PathBuf::from(format!("/{}", "d".repeat(119)));
+        assert_eq!(herdr_forward_path(&long, &lucy_with_herdr()), None);
+    }
+
+    #[test]
+    fn recognizes_our_leftover_tunnel_with_forward() {
+        let ours = "ssh -N -D 127.0.0.1:47655 -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 -o StreamLocalBindUnlink=yes -L /Users/jds/Library/Application Support/WhatsUp/herdr-47655.sock:/home/jds/.config/herdr/herdr.sock lucy";
+        assert!(is_our_tunnel(ours, 47655));
+        assert!(!is_our_tunnel(ours, 47656));
+        let plain = "ssh -N -D 127.0.0.1:47655 -o BatchMode=yes -o ExitOnForwardFailure=yes -o ServerAliveInterval=5 -o ServerAliveCountMax=2 lucy";
+        assert!(is_our_tunnel(plain, 47655));
+        assert!(!is_our_tunnel(&plain.replace(" lucy", " -R x lucy"), 47655));
+        assert!(!is_our_tunnel(
+            &ours.replace("herdr-47655.sock", "other.sock"),
+            47655
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stopping_a_tunnel_removes_its_socket_file() {
+        let (dir, script) = super::testing::running_stub("unlink");
+        let tunnels = Tunnels::new(script, dir.clone());
+        tunnels.reconcile(&[lucy_with_herdr()]);
+        assert!(wait_for(|| tunnels.state("lucy") == Some(TunnelState::Running)).await);
+        let socket = dir.join("herdr-47695.sock");
+        std::fs::write(&socket, "").unwrap();
+        tunnels.reconcile(&[]);
+        assert!(!socket.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn herdr_socket_only_while_running() {
+        let (dir, script) = stub("herdr-exit", "exit 1");
+        let tunnels = Tunnels::new(script, dir.clone());
+        tunnels.reconcile(&[lucy_with_herdr()]);
+        assert!(
+            wait_for(|| matches!(tunnels.state("lucy"), Some(TunnelState::Waiting { .. }))).await
+        );
+        assert_eq!(tunnels.herdr_socket("lucy"), None);
+        tunnels.shutdown();
+        let _ = std::fs::remove_dir_all(dir);
+
+        let (dir, script) = super::testing::running_stub("herdr-up");
+        let tunnels = Tunnels::new(script, dir.clone());
+        tunnels.reconcile(&[lucy_with_herdr()]);
+        assert!(wait_for(|| tunnels.state("lucy") == Some(TunnelState::Running)).await);
+        assert_eq!(
+            tunnels.herdr_socket("lucy"),
+            Some(dir.join("herdr-47695.sock"))
+        );
+        tunnels.reconcile(&[lucy()]);
+        assert!(wait_for(|| tunnels.state("lucy") == Some(TunnelState::Running)).await);
+        assert_eq!(tunnels.herdr_socket("lucy"), None);
+        tunnels.shutdown();
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -454,7 +621,7 @@ mod tests {
             "noise",
             "echo 'channel 2: open failed: connect failed: Connection refused' >&2\necho 'Connection closed by remote host' >&2\necho 'channel 3: open failed: connect failed: Connection refused' >&2\nexit 255",
         );
-        let tunnels = Tunnels::new(script);
+        let tunnels = Tunnels::new(script, dir.clone());
         tunnels.reconcile(&[lucy()]);
         let reported = wait_for(|| {
             tunnels.state("lucy")
@@ -475,7 +642,7 @@ mod tests {
             // What OpenSSH really prints when the forward port is taken.
             "echo 'bind [127.0.0.1]:47695: Address already in use' >&2\necho 'channel_setup_fwd_listener_tcpip: cannot listen to port: 47695' >&2\necho 'Could not request local forwarding.' >&2\nexit 255",
         );
-        let tunnels = Tunnels::new(script);
+        let tunnels = Tunnels::new(script, dir.clone());
         tunnels.reconcile(&[lucy()]);
         let reported = wait_for(|| {
             matches!(

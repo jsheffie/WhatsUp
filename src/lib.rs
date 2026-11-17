@@ -1,5 +1,6 @@
 pub mod browser;
 pub mod config;
+pub mod herdr;
 pub mod instance;
 pub mod probe;
 pub mod server;
