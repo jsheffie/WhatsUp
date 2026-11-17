@@ -190,6 +190,19 @@
     tr.black.all-up td { background: var(--black-all-up); }
     tr.hidden { display: none; }
 
+    /* The herdr workspace after a stack name: "jds/h1-herberth". */
+    .herdr {
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .herdr .label {
+      display: inline-block;
+      max-width: 22ch;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: bottom;
+    }
+
     .service {
       display: flex;
       align-items: center;
@@ -502,6 +515,18 @@
       if (!cell || cell.type === "empty") return td;
       if (cell.type === "text") {
         td.textContent = cell.text;
+        const herdr = cell.herdr || [];
+        if (herdr.length) {
+          const extra = document.createElement("span");
+          extra.className = "herdr";
+          const label = document.createElement("span");
+          label.className = "label";
+          label.textContent = herdr[0];
+          extra.append("/", label);
+          if (herdr.length > 1) extra.append(" +" + (herdr.length - 1));
+          td.appendChild(extra);
+          td.title = "herdr: " + herdr.join(", ");
+        }
         return td;
       }
       const button = document.createElement("button");
