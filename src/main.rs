@@ -9,7 +9,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 
 use whatsup::browser::open_in_browser;
-use whatsup::config::{config_dir, load_config, resolve_config_path};
+use whatsup::config::{config_dir, load_config, resolve_config_path, runtime_dir};
 use whatsup::instance;
 use whatsup::server::{router, AppState, SystemOpener};
 use whatsup::tunnel::Tunnels;
@@ -36,6 +36,7 @@ fn run() -> Result<(), String> {
     let config_path = resolve_config_path(args.config)?;
     let config = load_config(&config_path)?;
     let instance_path = instance::instance_path()?;
+    let runtime_dir = runtime_dir()?;
 
     if let Some(running) = instance::read_running(&instance_path)? {
         if running.pid != std::process::id() && instance::process_alive(running.pid) {
@@ -84,7 +85,7 @@ fn run() -> Result<(), String> {
         println!("Config: {}", config_path.display());
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
-        let tunnels = Arc::new(Tunnels::new(PathBuf::from("ssh")));
+        let tunnels = Arc::new(Tunnels::new(PathBuf::from("ssh"), runtime_dir.clone()));
         let state = AppState::new(
             config_path,
             config.clone(),

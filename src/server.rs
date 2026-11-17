@@ -376,7 +376,7 @@ mod tests {
         let config = load_config(&config_path).unwrap();
         let (shutdown, _rx) = watch::channel(false);
         let opener = Arc::new(Recording(Mutex::new(Vec::new())));
-        let tunnels = Arc::new(Tunnels::new(program));
+        let tunnels = Arc::new(Tunnels::new(program, std::env::temp_dir()));
         let state = AppState::new(
             config_path,
             config,
@@ -679,7 +679,7 @@ mod tests {
             opener.clone(),
             shutdown,
             HOSTNAME.to_string(),
-            Arc::new(Tunnels::new(PathBuf::from("true"))),
+            Arc::new(Tunnels::new(PathBuf::from("true"), std::env::temp_dir())),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
