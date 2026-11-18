@@ -28,6 +28,10 @@
       --stop-hover: #ee4c55;
       --start: #1a7f46;
       --start-hover: #23a35b;
+      /* Disabled pills: translucent, so they show on every row tone, the
+         green up-tint included. */
+      --disabled-line: rgba(255, 255, 255, 0.24);
+      --disabled-text: rgba(232, 234, 237, 0.42);
     }
 
     * { box-sizing: border-box; }
@@ -309,13 +313,11 @@
     }
 
     button.start:disabled, button.stop:disabled {
-      border-color: var(--line);
+      border-color: var(--disabled-line);
       background: transparent;
-      color: var(--muted);
+      color: var(--disabled-text);
       cursor: default;
     }
-
-    button.start.idle:disabled, button.stop.idle:disabled { opacity: 0.6; }
 
     button.start.starting { border-color: var(--start-hover); color: var(--text); }
     button.start.starting .glyph { background: var(--start-hover); }
