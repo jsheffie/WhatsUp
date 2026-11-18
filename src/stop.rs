@@ -53,8 +53,11 @@ pub struct SystemStopper {
     pub grace: Duration,
     /// How long to wait for the port after SIGKILL.
     pub kill_wait: Duration,
-    /// How long one docker command may run.
+    /// How long one docker stop command may run.
     pub command_timeout: Duration,
+    /// How long the `docker ps` listing may take; a docker that hangs then
+    /// simply owns no ports.
+    pub list_timeout: Duration,
 }
 
 impl Default for SystemStopper {
@@ -71,6 +74,7 @@ impl SystemStopper {
             grace: Duration::from_secs(5),
             kill_wait: Duration::from_secs(2),
             command_timeout: Duration::from_secs(60),
+            list_timeout: Duration::from_secs(5),
         }
     }
 }
@@ -229,19 +233,88 @@ fn process_name(pid: u32) -> String {
         .unwrap_or_default()
 }
 
-fn signal_for(pid: u32) -> Option<Signal> {
-    let pid = i32::try_from(pid).ok()?;
-    // SAFETY: getpgid and getpgrp have no memory-safety preconditions.
-    let (group, own_group) = unsafe { (libc::getpgid(pid), libc::getpgrp()) };
-    if group < 0 {
-        // The process is already gone.
-        return None;
-    }
-    Some(if group <= 1 || group == own_group {
-        Signal::Pid(pid)
-    } else {
-        Signal::Group(group)
-    })
+/// Every process as (pid, parent, group), from `ps`.
+fn process_table() -> Vec<(i32, i32, i32)> {
+    let Ok(output) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,pgid="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut numbers = line.split_whitespace().map(str::parse::<i32>);
+            Some((
+                numbers.next()?.ok()?,
+                numbers.next()?.ok()?,
+                numbers.next()?.ok()?,
+            ))
+        })
+        .collect()
+}
+
+/// Whether `group` is one job: each of its processes is one of `listeners`,
+/// an ancestor of one, or a descendant of one. A group that also holds
+/// something else (servers a script started side by side, a harness that
+/// does not give its children their own group) must not be signalled whole.
+fn group_is_one_job(table: &[(i32, i32, i32)], group: i32, listeners: &[i32]) -> bool {
+    let parent_of = |pid: i32| {
+        table
+            .iter()
+            .find(|(candidate, _, _)| *candidate == pid)
+            .map(|(_, parent, _)| *parent)
+    };
+    // `ancestor` is `pid` itself or above it; bounded against ppid cycles.
+    let descends_from = |pid: i32, ancestor: i32| {
+        let mut current = Some(pid);
+        for _ in 0..table.len() + 1 {
+            match current {
+                Some(pid) if pid == ancestor => return true,
+                Some(pid) if pid > 1 => current = parent_of(pid),
+                _ => return false,
+            }
+        }
+        false
+    };
+    let mut members = table
+        .iter()
+        .filter(|(_, _, pgid)| *pgid == group)
+        .map(|(pid, _, _)| *pid)
+        .peekable();
+    members.peek().is_some()
+        && members.all(|member| {
+            listeners.iter().any(|listener| {
+                descends_from(member, *listener) || descends_from(*listener, member)
+            })
+        })
+}
+
+/// What to signal to stop the listeners `pids`: their process group when it
+/// is one job, otherwise just them.
+fn signals_for(pids: &[u32], table: &[(i32, i32, i32)]) -> BTreeSet<Signal> {
+    let pids: Vec<i32> = pids
+        .iter()
+        .filter_map(|pid| i32::try_from(*pid).ok())
+        .collect();
+    // SAFETY: getpgrp has no memory-safety preconditions.
+    let own_group = unsafe { libc::getpgrp() };
+    pids.iter()
+        .filter_map(|pid| {
+            // SAFETY: getpgid has no memory-safety preconditions.
+            let group = unsafe { libc::getpgid(*pid) };
+            if group < 0 {
+                // The process is already gone.
+                return None;
+            }
+            let whole = group > 1 && group != own_group && group_is_one_job(table, group, &pids);
+            Some(if whole {
+                Signal::Group(group)
+            } else {
+                Signal::Pid(*pid)
+            })
+        })
+        .collect()
 }
 
 fn wait_closed(ports: &[u16], limit: Duration) -> bool {
@@ -267,7 +340,7 @@ fn describe(signals: &BTreeSet<Signal>) -> String {
 
 impl SystemStopper {
     /// Runs docker with `args`; the error is its last line of stderr.
-    fn docker(&self, docker: &Path, args: &[&str]) -> Result<String, String> {
+    fn docker(&self, docker: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
         let shown = format!("docker {}", args.join(" "));
         let mut command = Command::new(docker);
         command
@@ -300,7 +373,7 @@ impl SystemStopper {
         };
         let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
         let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
-        let deadline = Instant::now() + self.command_timeout;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -309,7 +382,7 @@ impl SystemStopper {
                     let _ = child.wait();
                     return Err(format!(
                         "{shown}: gave up after {} s",
-                        self.command_timeout.as_secs_f32()
+                        timeout.as_secs_f32()
                     ));
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
@@ -339,13 +412,12 @@ impl SystemStopper {
             };
         }
         let pids = listener_pids(port);
-        let mut signals = BTreeSet::new();
         for pid in &pids {
             if let Some(reason) = refusal(*pid, &process_name(*pid), std::process::id()) {
                 return Target::Refused(reason);
             }
-            signals.extend(signal_for(*pid));
         }
+        let signals = signals_for(&pids, &process_table());
         if !signals.is_empty() {
             Target::Process(signals)
         } else if port_is_open(port) {
@@ -392,7 +464,7 @@ impl SystemStopper {
 
     fn docker_stop(&self, args: &[&str]) -> Result<(), String> {
         let docker = self.docker.as_deref().ok_or("docker was not found")?;
-        self.docker(docker, args).map(|_| ())
+        self.docker(docker, args, self.command_timeout).map(|_| ())
     }
 }
 
@@ -401,8 +473,12 @@ impl Stopper for SystemStopper {
         // A docker that is missing or not answering publishes nothing; a
         // port it does hold is then refused by name instead of signalled.
         let containers = self.docker.as_deref().and_then(|docker| {
-            self.docker(docker, &["ps", "--no-trunc", "--format", DOCKER_PS_FORMAT])
-                .ok()
+            self.docker(
+                docker,
+                &["ps", "--no-trunc", "--format", DOCKER_PS_FORMAT],
+                self.list_timeout,
+            )
+            .ok()
         });
         let mut targets: BTreeMap<Target, Vec<u16>> = BTreeMap::new();
         for port in ports {
@@ -552,6 +628,7 @@ mod tests {
             grace: Duration::from_secs(5),
             kill_wait: Duration::from_secs(2),
             command_timeout: Duration::from_secs(10),
+            list_timeout: Duration::from_secs(5),
         }
     }
 
@@ -579,14 +656,29 @@ mod tests {
     /// beside it, like `npm start` runs vite. Returns sh, the listener's port
     /// and the listener's pid.
     fn spawn_listener(name: &str, ignore_term: bool) -> (std::process::Child, u16, i32) {
+        let (child, mut listeners) = spawn_listeners(name, ignore_term, 1);
+        let (port, pid) = listeners.remove(0);
+        (child, port, pid)
+    }
+
+    /// `count` helper listeners side by side under one `sh`, all in its
+    /// process group; each is (port, pid).
+    fn spawn_listeners(
+        name: &str,
+        ignore_term: bool,
+        count: usize,
+    ) -> (std::process::Child, Vec<(u16, i32)>) {
         let dir = temp_dir(name);
         let report = dir.join("port");
         let mut command = Command::new("sh");
+        let body =
+            "for n in $(seq $COUNT); do WHATSUP_TEST_LISTEN=$REPORT.$n \"$0\" \"$@\" & done; wait";
         command
-            .args(["-c", "\"$0\" \"$@\" & wait"])
+            .args(["-c", body])
+            .env("COUNT", count.to_string())
+            .env("REPORT", &report)
             .arg(std::env::current_exe().unwrap())
             .args(["--exact", "stop::tests::helper_listener", "--nocapture"])
-            .env("WHATSUP_TEST_LISTEN", &report)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
@@ -595,17 +687,22 @@ mod tests {
         }
         let child = command.spawn().unwrap();
         let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            if let Ok(text) = std::fs::read_to_string(&report) {
-                let mut words = text.split_whitespace();
-                let port = words.next().unwrap().parse().unwrap();
-                let pid = words.next().unwrap().parse().unwrap();
-                let _ = std::fs::remove_dir_all(dir);
-                return (child, port, pid);
+        let mut listeners = Vec::new();
+        for n in 1..=count {
+            let report = dir.join(format!("port.{n}"));
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&report) {
+                    let mut words = text.split_whitespace();
+                    let port = words.next().unwrap().parse().unwrap();
+                    listeners.push((port, words.next().unwrap().parse().unwrap()));
+                    break;
+                }
+                assert!(Instant::now() < deadline, "the helper never listened");
+                std::thread::sleep(Duration::from_millis(20));
             }
-            assert!(Instant::now() < deadline, "the helper never listened");
-            std::thread::sleep(Duration::from_millis(20));
         }
+        let _ = std::fs::remove_dir_all(dir);
+        (child, listeners)
     }
 
     fn gone(pid: i32) -> bool {
@@ -652,6 +749,67 @@ mod tests {
         assert!(!port_is_open(port));
         let _ = shell.wait();
         assert!(gone(listener));
+    }
+
+    #[test]
+    fn one_job_groups() {
+        // shell(10) > just(20, leads group 20) > pnpm(21) > vite(22) > esbuild(23)
+        let job = [
+            (10, 1, 10),
+            (20, 10, 20),
+            (21, 20, 20),
+            (22, 21, 20),
+            (23, 22, 20),
+        ];
+        assert!(group_is_one_job(&job, 20, &[22]));
+        // The same group with a second server beside the first.
+        let mut shared = job.to_vec();
+        shared.push((30, 20, 20));
+        assert!(!group_is_one_job(&shared, 20, &[22]));
+        assert!(group_is_one_job(&shared, 20, &[22, 30]));
+        // A leader that has exited leaves the rest one job.
+        let orphaned = [(21, 1, 20), (22, 21, 20)];
+        assert!(group_is_one_job(&orphaned, 20, &[22]));
+        // A harness that keeps its children in its own group.
+        let harness = [(5, 1, 5), (6, 5, 5), (7, 5, 5), (8, 7, 5)];
+        assert!(!group_is_one_job(&harness, 5, &[8]));
+        assert!(!group_is_one_job(&job, 99, &[22]), "an empty group");
+    }
+
+    #[test]
+    fn a_shared_group_gets_pid_only_signals() {
+        let (mut shell, listeners) = spawn_listeners("shared", false, 2);
+        let (first, second) = (listeners[0], listeners[1]);
+        let results = stopper(None).stop(&[first.0]);
+        assert_eq!(results[0].action, Action::Process);
+        assert_eq!(results[0].error, None);
+        assert_eq!(results[0].detail, format!("pid {}", first.1));
+        assert!(!port_is_open(first.0));
+        assert!(port_is_open(second.0), "the neighbour was left alone");
+        // Both ports of the group together are one job.
+        let results = stopper(None).stop(&[second.0]);
+        assert_eq!(results[0].error, None);
+        assert!(!port_is_open(second.0));
+        // SAFETY: plain kill of the test's own child group.
+        unsafe { libc::kill(-(shell.id() as i32), libc::SIGKILL) };
+        let _ = shell.wait();
+    }
+
+    #[test]
+    fn a_hung_docker_listing_does_not_block_processes() {
+        let dir = temp_dir("hung");
+        let docker = dir.join("docker");
+        script(&docker, "exec sleep 5");
+        let (mut shell, port, _) = spawn_listener("hung-listener", false);
+        let mut stopper = stopper(Some(docker));
+        stopper.list_timeout = Duration::from_millis(200);
+        let started = Instant::now();
+        let results = stopper.stop(&[port]);
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(results[0].action, Action::Process);
+        assert_eq!(results[0].error, None);
+        let _ = shell.wait();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

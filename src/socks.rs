@@ -100,6 +100,15 @@ pub fn socks_connect(
     Ok(stream)
 }
 
+/// Why [`post_json`] has no reply to give.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PostError {
+    /// The tunnel is down, or nothing listens on the remote port.
+    Connect,
+    /// Connected, but no complete HTTP reply came back.
+    Reply(String),
+}
+
 /// POSTs a JSON `body` to the WhatsUp listening on the remote machine's
 /// loopback `port`, through the tunnel, and returns the status and body of
 /// its reply. The connection is used once (`Connection: close`).
@@ -109,31 +118,31 @@ pub fn post_json(
     path: &str,
     body: &str,
     read_timeout: Duration,
-) -> Result<(u16, String), String> {
+) -> Result<(u16, String), PostError> {
     let mut stream = socks_connect(socks_port, "127.0.0.1", port, REMOTE_TIMEOUT)
-        .map_err(|reach| format!("could not connect ({reach:?})"))?;
+        .map_err(|_| PostError::Connect)?;
     stream
         .set_read_timeout(Some(read_timeout))
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| PostError::Reply(err.to_string()))?;
     write!(
         stream,
         "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     )
-    .map_err(|err| format!("could not send the request: {err}"))?;
+    .map_err(|err| PostError::Reply(format!("could not send the request: {err}")))?;
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
-        .map_err(|err| format!("no reply: {err}"))?;
+        .map_err(|err| PostError::Reply(format!("no reply: {err}")))?;
     let response = String::from_utf8_lossy(&response);
     let (head, body) = response
         .split_once("\r\n\r\n")
-        .ok_or("the reply is not http")?;
+        .ok_or_else(|| PostError::Reply("the reply is not http".into()))?;
     let status = head
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse::<u16>().ok())
-        .ok_or("the reply is not http")?;
+        .ok_or_else(|| PostError::Reply("the reply is not http".into()))?;
     Ok((status, body.to_string()))
 }
 
@@ -351,8 +360,11 @@ mod tests {
     #[test]
     fn post_json_fails_without_a_listener() {
         let (socks, _requests) = fake::start(|_, _| Act::Close);
-        assert!(post_json(socks, 47654, "/api/stop", "{}", QUICK).is_err());
-        assert!(post_json(1, 47654, "/api/stop", "{}", QUICK).is_err());
+        let post = |socks| post_json(socks, 47654, "/api/stop", "{}", QUICK);
+        assert_eq!(post(socks), Err(PostError::Connect));
+        assert_eq!(post(1), Err(PostError::Connect));
+        let (silent, _requests) = fake::start(|_, _| Act::Reply(0));
+        assert!(matches!(post(silent), Err(PostError::Reply(_))));
     }
 
     #[test]
