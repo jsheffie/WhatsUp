@@ -127,6 +127,19 @@ A server may still be booting in its tab after Start returns, and a Stop then fi
 
 Rollout: older versions reject unknown fields, so install the new WhatsUp on every machine before adding `start` or `id` to a shared config.
 
+## Machine load
+
+Under the summary, each machine has a line with its CPU, RAM and disk use, refreshed with the dashboard. A number turns amber, then red, as it nears the point where it is worth stopping a stack.
+
+| | Measures | Amber at | Red at |
+|---|---|---|---|
+| CPU | percent busy across all cores, averaged over 10 s | 75% | 90% |
+| RAM | percent in use, meaning not available: Linux `MemAvailable`, macOS the kernel's memory pressure level (as `memory_pressure` prints it) | 80% | 90% |
+| Disk | percent not available on the filesystem holding your home folder (the data volume on macOS, not the sealed `/`) | 85% | 95% |
+
+- Hover a number for details: core count, total memory and swap in use, free space.
+- Each WhatsUp samples its own machine every 2 s and serves it at `GET /api/load`. A remote's numbers come from its own WhatsUp through the tunnel, so that machine needs this version too. Until it has it, its line says `update WhatsUp on <name> to see its load`.
+
 ## herdr workspace labels
 
 When a stack runs in its own herdr workspace, the dashboard can show that workspace's name next to the stack: the Workspace cell `jds` reads `jds/h1-herberth`.
