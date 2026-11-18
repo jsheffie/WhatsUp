@@ -48,6 +48,8 @@ pub struct Group {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
+    /// Optional short name for the row (CLI and logs); unique across groups.
+    pub id: Option<String>,
     pub tone: Tone,
     pub cells: Vec<Cell>,
     /// Machines this row belongs to; `None` shows it on every machine.
@@ -66,6 +68,22 @@ impl Row {
             })
             .collect();
         ports.into_iter().collect()
+    }
+
+    /// The prefix of the row's first herdr cell.
+    pub fn herdr_prefix(&self) -> Option<&str> {
+        self.cells.iter().find_map(|cell| match cell {
+            Cell::Herdr(herdr) => Some(herdr.prefix.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The row's id, else `<group>/<index>`.
+    pub fn name(&self, group_id: &str, index: usize) -> String {
+        match &self.id {
+            Some(id) => id.clone(),
+            None => format!("{group_id}/{index}"),
+        }
     }
 
     pub fn shown_on(&self, machine: &str) -> bool {
@@ -105,6 +123,26 @@ pub struct Link {
     pub url: String,
     pub host: String,
     pub port: u16,
+    pub start: Option<StartCommand>,
+}
+
+/// How to start the stack a link belongs to: run `run` in `dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartCommand {
+    /// As written in the config; `~` is expanded at start time.
+    pub dir: String,
+    pub run: String,
+}
+
+/// Expand a leading `~` in `dir` to `home`.
+pub fn expand_dir(dir: &str, home: &Path) -> PathBuf {
+    if dir == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = dir.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(dir)
+    }
 }
 
 impl DashboardConfig {
@@ -404,6 +442,8 @@ struct RawGroup {
 #[serde(deny_unknown_fields)]
 struct RawRow {
     #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
     tone: Option<String>,
     cells: Vec<Value>,
     #[serde(default)]
@@ -435,12 +475,21 @@ impl RawConfig {
         }
         let refresh_ms = self.refresh_ms.clamp(500, 60_000);
         let mut seen_ids = BTreeSet::new();
+        let mut seen_row_ids = BTreeSet::new();
         let mut groups = Vec::with_capacity(self.groups.len());
         for group in self.groups {
             if !seen_ids.insert(group.id.clone()) {
                 return Err(format!("duplicate group id {}", group.id));
             }
-            groups.push(group.into_group()?);
+            let group = group.into_group()?;
+            for row in &group.rows {
+                if let Some(id) = &row.id {
+                    if !seen_row_ids.insert(id.to_ascii_lowercase()) {
+                        return Err(format!("duplicate row id {id}"));
+                    }
+                }
+            }
+            groups.push(group);
         }
         let mut seen_remotes = BTreeSet::new();
         let mut remotes = Vec::with_capacity(self.remotes.len());
@@ -517,11 +566,44 @@ impl RawRow {
                 ));
             }
         }
+        if let Some(id) = &self.id {
+            if id.is_empty()
+                || id.chars().count() > 32
+                || !id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+            {
+                return Err(format!(
+                    "group {group_id} row {index} id must be 1 to 32 letters, digits, - or _"
+                ));
+            }
+        }
         let mut cells = Vec::with_capacity(self.cells.len());
         for (cell_index, value) in self.cells.into_iter().enumerate() {
             cells.push(parse_cell(group_id, index, cell_index, value)?);
         }
+        let has_herdr = cells.iter().any(|cell| matches!(cell, Cell::Herdr(_)));
+        let mut started_ports = BTreeSet::new();
+        for (cell_index, cell) in cells.iter().enumerate() {
+            let Cell::Link(link) = cell else { continue };
+            if link.start.is_none() {
+                continue;
+            }
+            let at = format!("group {group_id} row {index} column {cell_index}");
+            if !has_herdr {
+                return Err(format!(
+                    "{at} start commands need a herdr cell to name the workspace"
+                ));
+            }
+            if !started_ports.insert(link.port) {
+                return Err(format!(
+                    "{at} port {} already has a start command in this row",
+                    link.port
+                ));
+            }
+        }
         Ok(Row {
+            id: self.id,
             tone,
             cells,
             machines: self.machines,
@@ -560,22 +642,48 @@ fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result
                     "{at} port {port} does not match the port in {url} ({url_port})"
                 ));
             }
-            let known = ["label", "url", "port"];
+            let known = ["label", "url", "port", "start"];
             for key in map.keys() {
                 if !known.contains(&key.as_str()) {
                     return Err(format!("{at} has unknown field {key}"));
                 }
             }
             let host = host_from_url(&url)?;
+            let start = match map.get("start") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(start)) => Some(parse_start(start, &at)?),
+                Some(_) => return Err(format!("{at} start must be an object")),
+            };
             Ok(Cell::Link(Link {
                 label,
                 url,
                 host,
                 port,
+                start,
             }))
         }
         _ => Err(format!("{at} must be a string, a link, or null")),
     }
+}
+
+fn parse_start(map: &serde_json::Map<String, Value>, at: &str) -> Result<StartCommand, String> {
+    for key in map.keys() {
+        if !["dir", "run"].contains(&key.as_str()) {
+            return Err(format!("{at} start has unknown field {key}"));
+        }
+    }
+    let dir = required_string(map, "dir", &format!("{at} start"))?;
+    let run = required_string(map, "run", &format!("{at} start"))?;
+    if !(dir == "~" || dir.starts_with("~/") || dir.starts_with('/')) {
+        return Err(format!("{at} start dir must be absolute or start with ~/"));
+    }
+    if dir.chars().any(|ch| ch.is_control()) {
+        return Err(format!("{at} start dir has a control character"));
+    }
+    if run.chars().any(|ch| ch == '\n' || ch == '\r') {
+        return Err(format!("{at} start run must be one line"));
+    }
+    Ok(StartCommand { dir, run })
 }
 
 fn parse_herdr_cell(map: &serde_json::Map<String, Value>, at: &str) -> Result<Cell, String> {
@@ -1042,5 +1150,113 @@ mod tests {
         assert_eq!(port_from_url("http://localhost").unwrap(), 80);
         assert_eq!(port_from_url("https://example.com/admin/").unwrap(), 443);
         assert_eq!(port_from_url("http://[::1]:2023/admin/").unwrap(), 2023);
+    }
+
+    fn start_row(extra_cell: &str, link_extra: &str) -> String {
+        format!(
+            r#"{{ "groups": [{{ "id": "pipelinecore", "label": "P", "columns": ["W", "A", "B"],
+                "rows": [{{ "cells": [{extra_cell}, {{ "label": "web", "url": "http://localhost:3002"{link_extra} }}, null] }}] }}] }}"#
+        )
+    }
+
+    const HERDR: &str = r#"{ "text": "jds", "herdr": "h2" }"#;
+    const START: &str = r#", "start": { "dir": "~/workspace/huvr2", "run": "tt2a" }"#;
+
+    #[test]
+    fn link_start_and_row_id_parse() {
+        let config = parse_config(
+            r#"{ "groups": [{ "id": "pipelinecore", "label": "P", "columns": ["W", "A"],
+                "rows": [
+                  { "cells": ["a", null] },
+                  { "id": "jds2", "cells": [{ "text": "jds", "herdr": "h2" },
+                    { "label": "web", "url": "http://localhost:3002",
+                      "start": { "dir": "~/workspace/huvr2", "run": "tt2a && cd frontend && npm start" } }] }
+                ] }] }"#,
+        )
+        .unwrap();
+        let rows = &config.groups[0].rows;
+        let link = config.links().next().unwrap();
+        assert_eq!(
+            link.start,
+            Some(StartCommand {
+                dir: "~/workspace/huvr2".into(),
+                run: "tt2a && cd frontend && npm start".into(),
+            })
+        );
+        assert_eq!(rows[1].id.as_deref(), Some("jds2"));
+        assert_eq!(rows[1].name("pipelinecore", 1), "jds2");
+        assert_eq!(rows[0].name("pipelinecore", 0), "pipelinecore/0");
+        assert_eq!(rows[1].herdr_prefix(), Some("h2"));
+        assert_eq!(rows[0].herdr_prefix(), None);
+    }
+
+    #[test]
+    fn start_needs_a_herdr_cell() {
+        let error = parse_config(&start_row(r#""plain""#, START)).unwrap_err();
+        assert!(
+            error.contains("start commands need a herdr cell to name the workspace"),
+            "{error}"
+        );
+        assert!(parse_config(&start_row(HERDR, START)).is_ok());
+    }
+
+    #[test]
+    fn start_rejects_bad_fields() {
+        let bad = [
+            r#", "start": { "dir": "~/x", "run": " " }"#,
+            r#", "start": { "dir": "~/x", "run": "a\nb" }"#,
+            r#", "start": { "dir": "workspace/x", "run": "a" }"#,
+            r#", "start": { "dir": "~/x", "run": "a", "env": "B" }"#,
+            r#", "start": { "dir": "~/x" }"#,
+            r#", "start": "tt2a""#,
+        ];
+        for start in bad {
+            let error = parse_config(&start_row(HERDR, start)).expect_err(start);
+            assert!(
+                error.contains("group pipelinecore row 0 column 1"),
+                "{start}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_starts_on_one_port_are_rejected() {
+        let text = format!(
+            r#"{{ "groups": [{{ "id": "g", "label": "G", "columns": ["W", "A", "B"],
+                "rows": [{{ "cells": [{HERDR},
+                  {{ "label": "web", "url": "http://localhost:3002"{START} }},
+                  {{ "label": "admin", "url": "http://localhost:3002/admin/"{START} }}] }}] }}] }}"#
+        );
+        let error = parse_config(&text).unwrap_err();
+        assert!(error.contains("already has a start command"), "{error}");
+    }
+
+    #[test]
+    fn row_ids_are_checked() {
+        let one = |id: &str| {
+            format!(
+                r#"{{ "groups": [{{ "id": "g", "label": "G", "columns": ["A"],
+                    "rows": [{{ "id": "{id}", "cells": ["x"] }}] }}] }}"#
+            )
+        };
+        assert!(parse_config(&one("jds2")).is_ok());
+        assert!(parse_config(&one("jds 2")).is_err());
+        assert!(parse_config(&one("")).is_err());
+        assert!(parse_config(&one(&"a".repeat(32))).is_ok());
+        assert!(parse_config(&one(&"a".repeat(33))).is_err());
+        let two_groups = r#"{ "groups": [
+            { "id": "a", "label": "A", "columns": ["A"], "rows": [{ "id": "jds2", "cells": ["x"] }] },
+            { "id": "b", "label": "B", "columns": ["A"], "rows": [{ "id": "JDS2", "cells": ["x"] }] }
+        ] }"#;
+        let error = parse_config(two_groups).unwrap_err();
+        assert!(error.contains("duplicate row id"), "{error}");
+    }
+
+    #[test]
+    fn expand_dir_expands_home() {
+        let home = Path::new("/home/me");
+        assert_eq!(expand_dir("~/a b", home), PathBuf::from("/home/me/a b"));
+        assert_eq!(expand_dir("~", home), PathBuf::from("/home/me"));
+        assert_eq!(expand_dir("/abs", home), PathBuf::from("/abs"));
     }
 }
