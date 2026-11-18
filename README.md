@@ -166,7 +166,7 @@ whatsup stop  <row> [--machine <name>] [--json] [--port <port>]
 
 - `<row>` is a row `id` (case ignored) or `<group>/<index>` using the config index. `--machine` defaults to this machine.
 - Options go after the command. Before a command, `--port` is the port to listen on; after it, the port of the running WhatsUp.
-- `list` prints, for each machine, a summary line such as `megan 12/33 up` (marked `(offline)` or `(WhatsUp not running there)` when so), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
+- `list` prints, for each machine, a summary line such as `megan 12/33 up  cpu 23%  ram 50%  disk 88% (warn)` (marked `(offline)` or `(WhatsUp not running there)` when so; see Machine load), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
 - `start` and `stop` print one line per port (`3002  herdr   herdr tab jds2 portal in h2`). `stop` acts at once, with no confirmation.
 - `start --wait` then polls until every port it started is up, or `--timeout` seconds (default 180) pass. `--json` prints the server's reply as is.
 - Exit codes: 0 success; 1 the action failed or timed out; 2 usage, unknown row, or WhatsUp not running.
