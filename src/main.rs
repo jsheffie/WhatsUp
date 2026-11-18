@@ -12,6 +12,7 @@ use whatsup::browser::open_in_browser;
 use whatsup::cli;
 use whatsup::config::{config_dir, load_config, resolve_config_path, runtime_dir};
 use whatsup::instance;
+use whatsup::load::LoadMonitor;
 use whatsup::server::{router, Actions, AppState, SystemOpener};
 use whatsup::start::SystemStarter;
 use whatsup::stop::SystemStopper;
@@ -98,6 +99,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
         let hostname = short_hostname();
         let local_herdr = whatsup::herdr::local_socket(&|key| env::var_os(key));
         let starter = SystemStarter::new(local_herdr.clone(), config.machine_label(&hostname));
+        // Disk use is that of the filesystem holding the home folder, where
+        // stacks and their images live. On macOS's APFS that is the shared
+        // container, so it counts every volume's use.
+        let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
+        let monitor = LoadMonitor::start(home);
         let state = AppState::new(
             config_path,
             config.clone(),
@@ -110,7 +116,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             hostname,
             tunnels.clone(),
             local_herdr,
-        );
+        )
+        .with_load(Arc::new(move || monitor.latest()));
         let app = router(state);
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
             let _ = shutdown_rx.wait_for(|stop| *stop).await;

@@ -23,6 +23,7 @@
       --chip: #15181d;
       --focus: #ffd166;
       --remote: #d2a8ff;
+      --warn: #e3b341;
       --remote-line: #6e40c9;
       --stop: #d6363f;
       --stop-hover: #ee4c55;
@@ -69,6 +70,49 @@
       color: var(--muted);
       font-size: 13px;
     }
+
+    /* One line per machine: CPU, RAM and disk use. A grid, so the numbers
+       of several machines line up under each other. */
+    .load {
+      display: grid;
+      grid-template-columns: repeat(4, max-content);
+      align-items: center;
+      gap: 4px 18px;
+      margin-top: 8px;
+      font-size: 13px;
+    }
+
+    .load.single { grid-template-columns: repeat(3, max-content); }
+    .load:empty { display: none; }
+    .load-line { display: contents; }
+    /* Each machine starts a row, even one showing only its tag. */
+    .load-line > :first-child { grid-column-start: 1; }
+    .load .tag { justify-self: start; }
+    .load .note { grid-column: span 3; }
+
+    .metric {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .metric .value { color: var(--text); min-width: 3.2ch; text-align: right; }
+    .metric.warn .value { color: var(--warn); }
+    .metric.high .value { color: var(--down); }
+
+    .meter {
+      width: 36px;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--line);
+      overflow: hidden;
+    }
+
+    .meter > span { display: block; height: 100%; background: var(--muted); }
+    .metric.warn .meter > span { background: var(--warn); }
+    .metric.high .meter > span { background: var(--down); }
 
     .actions {
       display: flex;
@@ -356,6 +400,10 @@
        tables (which scroll in their boxes) and the tabs (which scroll too). */
     @media (max-width: 640px) {
       header { padding: 16px 16px 0; }
+      .load { display: flex; flex-direction: column; align-items: flex-start; }
+      .load-line { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; }
+      /* The colored percent carries the level; meters would wrap the line. */
+      .load .meter { display: none; }
       main { padding: 16px 16px 32px; }
       .title-row { flex-wrap: wrap; align-items: center; }
       .actions { padding-bottom: 0; }
@@ -370,6 +418,7 @@
       <div>
         <h1 id="title">WhatsUp</h1>
         <p class="summary" id="summary">Checking local ports…</p>
+        <div class="load" id="load" role="group" aria-label="Machine load"></div>
       </div>
       <div class="actions">
         <label class="toggle">
@@ -390,6 +439,7 @@
     const tabsEl = document.getElementById("tabs");
     const tablesEl = document.getElementById("tables");
     const summaryEl = document.getElementById("summary");
+    const loadEl = document.getElementById("load");
     const titleEl = document.getElementById("title");
     const bannerEl = document.getElementById("banner");
     const footerEl = document.getElementById("footer");
@@ -489,6 +539,11 @@
     function viewKey(data) {
       const copy = Object.assign({}, data);
       delete copy.checked_at_ms;
+      // A shallow copy: map the machines rather than delete from them, or
+      // lastData would lose its load too.
+      if (data.machines) {
+        copy.machines = data.machines.map(({ load, load_note, ...rest }) => rest);
+      }
       return JSON.stringify(copy);
     }
 
@@ -506,6 +561,138 @@
       );
       summaryEl.textContent =
         data.ports_up + " of " + data.ports_total + " ports listening" + remotes.join("") + " · " + clock;
+    }
+
+    // 1024-based, whole numbers from 10 up: "36 GB", "1.5 GB", "468 MB".
+    function formatBytes(bytes) {
+      const units = ["B", "KB", "MB", "GB", "TB"];
+      let value = bytes;
+      let unit = 0;
+      while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit += 1;
+      }
+      return value.toFixed(value >= 10 || unit === 0 ? 0 : 1) + " " + units[unit];
+    }
+
+    // Whole percents, rounded down, so a number never reads as past the
+    // threshold its color says it has not reached.
+    function percent(part) {
+      return Math.floor(part.percent) + "%";
+    }
+
+    const METRICS = [
+      { key: "cpu", name: "CPU", tooltip: (cpu) => "10 s average across " + cpu.cores + " cores" },
+      {
+        key: "memory",
+        name: "RAM",
+        tooltip: (memory) =>
+          percent(memory) + " in use of " + formatBytes(memory.total) +
+          (memory.swap_used > 0 ? " · swap " + formatBytes(memory.swap_used) + " used" : ""),
+      },
+      {
+        key: "disk",
+        name: "Disk",
+        tooltip: (disk) => disk.path + " · " + formatBytes(disk.free) + " free of " + formatBytes(disk.total),
+      },
+    ];
+
+    // A machine's load as shown, or null when only a note (or nothing) is.
+    function shownLoad(machine) {
+      return machine.offline ? null : machine.load || null;
+    }
+
+    // What the load line's nodes depend on. Only a change here rebuilds
+    // them; numbers are patched in place, so a tooltip or a selection
+    // survives the refresh.
+    function loadShape(machines, multi) {
+      return JSON.stringify([multi, machines.map((machine) => {
+        const load = shownLoad(machine);
+        return [
+          machine.name,
+          machine.local,
+          load ? METRICS.map((metric) => Boolean(load[metric.key])) : machine.offline ? "offline" : machine.load_note || "",
+        ];
+      })]);
+    }
+
+    function metricEl(metric, present) {
+      const el = document.createElement("span");
+      el.className = "metric";
+      el.dataset.key = metric.key;
+      const label = document.createElement("span");
+      label.textContent = metric.name;
+      const value = document.createElement("span");
+      value.className = "value";
+      value.textContent = "-";
+      el.append(label, value);
+      if (present) {
+        const meter = document.createElement("span");
+        meter.className = "meter";
+        meter.setAttribute("aria-hidden", "true");
+        meter.appendChild(document.createElement("span"));
+        el.appendChild(meter);
+      }
+      return el;
+    }
+
+    function loadLine(machine, multi) {
+      const line = document.createElement("div");
+      line.className = "load-line";
+      if (multi) {
+        const tag = document.createElement("span");
+        tag.className = "tag" + (machine.local ? "" : " remote");
+        tag.textContent = machine.name;
+        line.appendChild(tag);
+      }
+      const load = shownLoad(machine);
+      if (load) {
+        METRICS.forEach((metric) => line.appendChild(metricEl(metric, Boolean(load[metric.key]))));
+      } else {
+        const text = machine.offline ? "offline" : machine.load_note;
+        if (text) {
+          const note = document.createElement("span");
+          note.className = "note";
+          note.textContent = text;
+          line.appendChild(note);
+        }
+      }
+      return line;
+    }
+
+    function setIfChanged(target, property, value) {
+      if (target[property] !== value) target[property] = value;
+    }
+
+    function updateLine(line, machine) {
+      const load = shownLoad(machine);
+      if (!load) return;
+      METRICS.forEach((metric) => {
+        const part = load[metric.key];
+        const el = line.querySelector('.metric[data-key="' + metric.key + '"]');
+        if (!part || !el) return;
+        setIfChanged(el, "className", "metric " + part.level);
+        setIfChanged(el.querySelector(".value"), "textContent", percent(part));
+        setIfChanged(el, "title", metric.tooltip(part));
+        const width = Math.min(100, Math.max(0, part.percent)) + "%";
+        const fill = el.querySelector(".meter > span");
+        if (fill.style.width !== width) fill.style.width = width;
+      });
+    }
+
+    // Painted on every refresh, outside the view key: load changes each
+    // tick and must not rebuild the tables.
+    let lastLoadShape = "";
+    function paintLoad(data) {
+      const machines = machinesOf(data);
+      const multi = machines.length > 1;
+      const shape = loadShape(machines, multi);
+      if (shape !== lastLoadShape) {
+        lastLoadShape = shape;
+        loadEl.classList.toggle("single", !multi);
+        loadEl.replaceChildren(...machines.map((machine) => loadLine(machine, multi)));
+      }
+      machines.forEach((machine, index) => updateLine(loadEl.children[index], machine));
     }
 
     function tabButton(filter, label) {
@@ -535,6 +722,7 @@
       document.title = title;
       titleEl.textContent = title;
       paintSummary(data);
+      paintLoad(data);
       notice("system", "");
       notice("config", data.config_error || "");
       // Before the early return: a row can come up without the view changing

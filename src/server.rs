@@ -18,8 +18,9 @@ use crate::config::{
     config_mtime, load_config, Cell, DashboardConfig, Group, Link, Remote, Row, Tone,
 };
 use crate::herdr::{list_workspaces, matching_labels, HerdrWorkspace, QUERY_BUDGET};
+use crate::load::{self, Load};
 use crate::probe::{port_is_open, probe_ports, CONNECT_TIMEOUT};
-use crate::socks::{post_json, probe_remote, PostError, Reach};
+use crate::socks::{get_json, post_json, probe_remote, PostError, Reach};
 use crate::start::{PortStart, StartKind, Starter};
 use crate::stop::{Action, PortResult, Stopper};
 use crate::tunnel::{TunnelState, Tunnels};
@@ -65,9 +66,14 @@ struct Inner {
     /// How long a stop or start forwarded to a remote WhatsUp may take.
     stop_forward_timeout: Duration,
     start_forward_timeout: Duration,
+    /// This machine's latest load sample.
+    load: LoadReader,
 }
 
 type Probe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+
+/// Reads this machine's latest load sample.
+pub type LoadReader = Arc<dyn Fn() -> Load + Send + Sync>;
 
 /// What the dashboard does to the machine it runs on.
 pub struct Actions {
@@ -110,6 +116,7 @@ impl AppState {
                 busy: Arc::default(),
                 stop_forward_timeout: STOP_FORWARD_TIMEOUT,
                 start_forward_timeout: START_FORWARD_TIMEOUT,
+                load: Arc::new(Load::default),
             }),
         }
     }
@@ -131,6 +138,13 @@ impl AppState {
     /// before the state is shared.
     pub fn with_probe(mut self, probe: Probe) -> Self {
         self.unshared().probe = probe;
+        self
+    }
+
+    /// Replaces where this machine's load comes from (the sampler in main,
+    /// a fixture in tests). Only before the state is shared.
+    pub fn with_load(mut self, load: LoadReader) -> Self {
+        self.unshared().load = load;
         self
     }
 
@@ -169,6 +183,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/dashboard", get(dashboard))
+        .route("/api/load", get(machine_load))
         .route("/api/open", post(open_link))
         .route("/api/start", post(start_row))
         .route("/api/stop", post(stop_row))
@@ -178,6 +193,11 @@ pub fn router(state: AppState) -> Router {
 
 async fn index() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+/// This machine's latest load sample, which a remote dashboard shows.
+async fn machine_load(State(state): State<AppState>) -> Json<Load> {
+    Json((state.inner.load)())
 }
 
 async fn dashboard(State(state): State<AppState>) -> Json<Value> {
@@ -204,6 +224,16 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
             tokio::task::spawn_blocking(move || probe_remote(socks_port, targets))
         })
         .collect();
+    // Each remote's load from its own WhatsUp, fetched alongside the probes.
+    let remote_loads: Vec<_> = remotes
+        .iter()
+        .map(|remote| {
+            let (socks_port, whatsup_port) = (remote.socks_port, remote.whatsup_port);
+            tokio::task::spawn_blocking(move || {
+                get_json(socks_port, whatsup_port, "/api/load", LOAD_READ_TIMEOUT)
+            })
+        })
+        .collect();
     // herdr workspace lists, queried alongside the probes; each is bounded
     // by QUERY_BUDGET and any failure just means no labels.
     let query_herdr = |machine: &str, socket: Option<std::path::PathBuf>| {
@@ -226,10 +256,17 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         counts: (0, 0),
         can_act: true,
         herdr: herdr_result(local_herdr).await,
+        load: Some((state.inner.load)()),
+        load_note: None,
     }];
     machines[0].counts = count_local(&config, &machines[0]);
-    for ((remote, probe), herdr) in remotes.iter().zip(remote_probes).zip(remote_herdr) {
+    let fetched = remote_probes
+        .into_iter()
+        .zip(remote_herdr)
+        .zip(remote_loads);
+    for (remote, ((probe, herdr), load)) in remotes.iter().zip(fetched) {
         let reach = probe.await.expect("remote probe");
+        let (load, load_note) = remote_load(&remote.name, load.await.expect("remote load"));
         let offline = reach.values().any(|reach| *reach == Reach::Offline);
         let tunnel_error = match state.inner.tunnels.state(&remote.name) {
             Some(TunnelState::Waiting { last_error }) => Some(last_error),
@@ -258,9 +295,31 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
             counts,
             can_act,
             herdr: herdr_result(herdr).await,
+            load,
+            load_note,
         });
     }
     Json(view(&config, &machines, &path, error))
+}
+
+/// How long a remote WhatsUp may take to send its load once connected.
+const LOAD_READ_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A remote's load from its `/api/load` reply. An older WhatsUp (404) gets
+/// a note; anything else missing is already explained by the machine's own
+/// offline or can_act state.
+fn remote_load(
+    name: &str,
+    reply: Result<(u16, String), PostError>,
+) -> (Option<Load>, Option<String>) {
+    match reply {
+        Ok((200, body)) => (serde_json::from_str(&body).ok(), None),
+        Ok((404, _)) => (
+            None,
+            Some(format!("update WhatsUp on {name} to see its load")),
+        ),
+        _ => (None, None),
+    }
 }
 
 /// The distinct (host, port) targets of the links shown on `machine`.
@@ -289,6 +348,10 @@ struct MachineStatus {
     can_act: bool,
     /// The machine's herdr workspaces, when they could be read.
     herdr: Option<Vec<HerdrWorkspace>>,
+    /// The machine's CPU, memory and disk use, when known.
+    load: Option<Load>,
+    /// Why a remote machine's load is missing, when the user can fix it.
+    load_note: Option<String>,
 }
 
 async fn herdr_result(
@@ -793,6 +856,8 @@ fn view(
             "ports_up": machine.counts.0,
             "ports_total": machine.counts.1,
             "can_act": machine.can_act,
+            "load": machine.load.as_ref().map(load::view),
+            "load_note": machine.load_note,
         })).collect::<Vec<_>>(),
         "groups": machines
             .iter()
@@ -965,6 +1030,7 @@ mod tests {
         stopper: Arc<RecordingStopper>,
         starter: Arc<RecordingStarter>,
         real_probe: bool,
+        load: Option<LoadReader>,
     }
 
     impl Fakes {
@@ -1046,6 +1112,9 @@ mod tests {
         .with_forward_timeout(Duration::from_millis(500));
         if !fakes.real_probe {
             state = state.with_probe(Arc::new(|_, _| false));
+        }
+        if let Some(load) = fakes.load {
+            state = state.with_load(load);
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1263,11 +1332,62 @@ mod tests {
                 "ports_up": json["ports_up"],
                 "ports_total": json["ports_total"],
                 "can_act": true,
+                "load": { "cpu": null, "memory": null, "disk": null },
+                "load_note": null,
             }])
         );
         assert_eq!(json["groups"][0]["machine"], HOSTNAME);
         assert_eq!(json["groups"][0]["key"], format!("{HOSTNAME}/web-stacks"));
         assert_eq!(json["groups"][0]["id"], "web-stacks");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn load_fixture() -> crate::load::Load {
+        crate::load::Load {
+            cpu: Some(crate::load::Cpu {
+                percent: 23.0,
+                cores: 12,
+            }),
+            memory: Some(crate::load::Memory {
+                percent: 50.0,
+                total: 36 << 30,
+                swap_used: 468 << 20,
+            }),
+            disk: Some(crate::load::Disk {
+                percent: 88.4,
+                total: 460 << 30,
+                free: 53 << 30,
+                path: "/Users/jds".into(),
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_load_is_in_the_view() {
+        let (_, program) = crate::tunnel::testing::running_stub("server-local-load");
+        let fakes = Fakes {
+            load: Some(Arc::new(load_fixture)),
+            ..Default::default()
+        };
+        let (addr, _opener, dir) = serve_all(
+            "local-load",
+            crate::DEFAULT_CONFIG_JSON,
+            program,
+            std::env::temp_dir(),
+            None,
+            fakes,
+        )
+        .await;
+        let json = dashboard_json(addr).await;
+        let machine = &json["machines"][0];
+        assert_eq!(machine["load"]["disk"]["level"], "warn");
+        assert_eq!(machine["load"]["cpu"]["percent"], 23.0);
+        assert_eq!(machine["load_note"], Value::Null);
+        let body = tokio::task::spawn_blocking(move || http(addr, "GET", "/api/load", None).1)
+            .await
+            .unwrap();
+        let served: crate::load::Load = serde_json::from_str(body_of(&body)).unwrap();
+        assert_eq!(served, load_fixture());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1818,6 +1938,136 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
+    /// A stand-in for lucy's WhatsUp on every connection: `reply` to each
+    /// request, or (`None`) accept and never answer.
+    fn fake_remote(reply: Option<&'static str>) -> u16 {
+        let listener = StdListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                std::thread::spawn(move || {
+                    let mut seen = [0u8; 1024];
+                    let _ = stream.read(&mut seen);
+                    match reply {
+                        Some(reply) => {
+                            let _ = stream.write_all(reply.as_bytes());
+                        }
+                        None => std::thread::sleep(Duration::from_secs(5)),
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// megan's dashboard with lucy's WhatsUp at `whatsup_port`.
+    async fn megan_dashboard(name: &str, whatsup_port: u16) -> Value {
+        let (socks_port, _requests) =
+            crate::socks::fake::start(|_, _| crate::socks::fake::Act::Relay);
+        let fakes = Fakes {
+            load: Some(Arc::new(load_fixture)),
+            ..Default::default()
+        };
+        let (megan, dir) =
+            serve_config(name, &forward_config(socks_port, whatsup_port, ""), fakes).await;
+        let json = dashboard_json(megan).await;
+        let _ = std::fs::remove_dir_all(dir);
+        json
+    }
+
+    fn lucy_of(json: &Value) -> &Value {
+        json["machines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|machine| machine["name"] == "lucy")
+            .expect("lucy")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn remote_load_is_shown() {
+        let lucy_load = || crate::load::Load {
+            memory: Some(crate::load::Memory {
+                percent: 58.3,
+                total: 32 << 30,
+                swap_used: 11 << 30,
+            }),
+            ..Default::default()
+        };
+        let fakes = Fakes {
+            load: Some(Arc::new(lucy_load)),
+            ..Default::default()
+        };
+        let (lucy, lucy_dir) = serve_config(
+            "load-lucy",
+            &forward_config(1, 1, r#""machine_names": { "testhost": "lucy" },"#),
+            fakes,
+        )
+        .await;
+        let json = megan_dashboard("load-megan", lucy.port()).await;
+        let lucy_view = lucy_of(&json);
+        assert_eq!(lucy_view["load"]["memory"]["percent"], 58.3);
+        assert_eq!(lucy_view["load"]["memory"]["level"], "ok");
+        assert_eq!(lucy_view["load"]["cpu"], Value::Null);
+        assert_eq!(lucy_view["load_note"], Value::Null);
+        assert_eq!(json["machines"][0]["load"]["disk"]["level"], "warn");
+        let _ = std::fs::remove_dir_all(lucy_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn older_remote_gets_an_update_note() {
+        let old = fake_remote(Some("HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"));
+        let json = megan_dashboard("load-old", old).await;
+        let lucy_view = lucy_of(&json);
+        assert_eq!(lucy_view["load"], Value::Null);
+        assert_eq!(
+            lucy_view["load_note"],
+            "update WhatsUp on lucy to see its load"
+        );
+        // A note, never an error: the dashboard shows no banner for it.
+        assert_eq!(json["config_error"], Value::Null);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dead_remote_whatsup_adds_nothing() {
+        let closed = StdListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let json = megan_dashboard("load-dead", port).await;
+        let lucy_view = lucy_of(&json);
+        assert_eq!(lucy_view["load"], Value::Null);
+        assert_eq!(lucy_view["load_note"], Value::Null);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn silent_remote_does_not_hold_up_the_dashboard() {
+        let silent = fake_remote(None);
+        let started = std::time::Instant::now();
+        let json = megan_dashboard("load-silent", silent).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(lucy_of(&json)["load"], Value::Null);
+        assert_eq!(json["machines"][0]["load"]["cpu"]["percent"], 23.0);
+    }
+
+    #[test]
+    fn remote_load_reads_only_a_good_reply() {
+        assert_eq!(remote_load("lucy", Ok((200, "hello".into()))), (None, None));
+        assert_eq!(remote_load("lucy", Ok((500, "{}".into()))), (None, None));
+        assert_eq!(remote_load("lucy", Err(PostError::Timeout)), (None, None));
+        assert_eq!(
+            remote_load(
+                "lucy",
+                Ok((200, r#"{"cpu":null,"memory":null,"disk":null}"#.into()))
+            ),
+            (Some(crate::load::Load::default()), None)
+        );
+    }
+
     fn herdr(prefix: &str, label: &str, dir: &str, run: &str) -> StartKind {
         StartKind::Herdr {
             prefix: prefix.into(),
@@ -2099,6 +2349,7 @@ mod tests {
             stopper: stopper.clone(),
             starter: starter.clone(),
             real_probe: false,
+            load: None,
         };
         let (addr, dir) = serve_config("busy", STOP_CONFIG, fakes).await;
 

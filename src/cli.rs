@@ -564,6 +564,30 @@ fn list_json(dashboard: &Value) -> Value {
     json!({ "machines": dashboard["machines"], "rows": list_rows(dashboard) })
 }
 
+/// A machine's load for its summary line: `  cpu 23%  ram 50%  disk 88%
+/// (warn)`, whole percents rounded down as the dashboard shows them, or the
+/// note saying why it is missing.
+fn format_load(machine: &Value) -> String {
+    let load = &machine["load"];
+    if load.is_null() {
+        return match machine["load_note"].as_str() {
+            Some(note) => format!(" ({note})"),
+            None => String::new(),
+        };
+    }
+    let mut text = String::new();
+    for (key, name) in [("cpu", "cpu"), ("memory", "ram"), ("disk", "disk")] {
+        let Some(percent) = load[key]["percent"].as_f64() else {
+            continue;
+        };
+        text.push_str(&format!("  {name} {}%", percent.floor()));
+        if let Some(level @ ("warn" | "high")) = load[key]["level"].as_str() {
+            text.push_str(&format!(" ({level})"));
+        }
+    }
+    text
+}
+
 /// Per machine, a summary line and then one line per row: its id (or
 /// `group/index`), its first text, and each port up or down with its labels.
 fn format_list(dashboard: &Value) -> String {
@@ -586,6 +610,7 @@ fn format_list(dashboard: &Value) -> String {
         {
             block.push_str(" (WhatsUp not running there)");
         }
+        block.push_str(&format_load(machine));
         block.push('\n');
         let mine: Vec<(String, &str, &Value)> = rows
             .iter()
@@ -995,6 +1020,36 @@ jeeves 0/0 up (offline)
         let mut broken = dashboard(false);
         broken["config_error"] = json!("groups is empty");
         assert!(format_list(&broken).starts_with("config error: groups is empty\n\nmegan 1/6 up\n"));
+    }
+
+    #[test]
+    fn list_shows_load() {
+        let mut board = dashboard(false);
+        board["machines"][0]["load"] = json!({
+            "cpu": { "percent": 23.9, "cores": 12, "level": "ok" },
+            "memory": { "percent": 50.0, "total": 1, "swap_used": 0, "level": "ok" },
+            "disk": { "percent": 88.5, "total": 1, "free": 0, "path": "/Users/jds", "level": "warn" },
+        });
+        board["machines"][1]["load"] = json!({
+            "cpu": { "percent": 95.0, "cores": 24, "level": "high" },
+            "memory": null,
+            "disk": null,
+        });
+        board["machines"][2]["load"] = Value::Null;
+        board["machines"][2]["load_note"] = json!("update WhatsUp on jeeves to see its load");
+        let text = format_list(&board);
+        let headers: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.starts_with(' ') && !line.is_empty())
+            .collect();
+        assert_eq!(
+            headers,
+            [
+                "megan 1/6 up  cpu 23%  ram 50%  disk 88% (warn)",
+                "lucy 0/2 up (WhatsUp not running there)  cpu 95% (high)",
+                "jeeves 0/0 up (offline) (update WhatsUp on jeeves to see its load)",
+            ]
+        );
     }
 
     #[test]

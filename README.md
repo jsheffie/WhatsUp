@@ -127,6 +127,19 @@ A server may still be booting in its tab after Start returns, and a Stop then fi
 
 Rollout: older versions reject unknown fields, so install the new WhatsUp on every machine before adding `start` or `id` to a shared config.
 
+## Machine load
+
+Under the summary, each machine has a line with its CPU, RAM and disk use, refreshed with the dashboard. A number turns amber, then red, as it nears the point where it is worth stopping a stack.
+
+| | Measures | Amber at | Red at |
+|---|---|---|---|
+| CPU | percent busy across all cores, averaged over 10 s | 75% | 90% |
+| RAM | percent in use, meaning not available: Linux `MemAvailable`, macOS the kernel's memory pressure level (as `memory_pressure` prints it) | 80% | 90% |
+| Disk | percent not available on the filesystem holding your home folder (on macOS, the APFS container all its volumes share, so `df -h /` shows a smaller "Used" for the system volume alone) | 85% | 95% |
+
+- Hover a number for details: core count, total memory and swap in use, free space.
+- Each WhatsUp samples its own machine every 2 s and serves it at `GET /api/load`. A remote's numbers come from its own WhatsUp through the tunnel, so that machine needs this version too. Until it has it, its line says `update WhatsUp on <name> to see its load`.
+
 ## herdr workspace labels
 
 When a stack runs in its own herdr workspace, the dashboard can show that workspace's name next to the stack: the Workspace cell `jds` reads `jds/h1-herberth`.
@@ -153,7 +166,7 @@ whatsup stop  <row> [--machine <name>] [--json] [--port <port>]
 
 - `<row>` is a row `id` (case ignored) or `<group>/<index>` using the config index. `--machine` defaults to this machine.
 - Options go after the command. Before a command, `--port` is the port to listen on; after it, the port of the running WhatsUp.
-- `list` prints, for each machine, a summary line such as `megan 12/33 up` (marked `(offline)` or `(WhatsUp not running there)` when so), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
+- `list` prints, for each machine, a summary line such as `megan 12/33 up  cpu 23%  ram 50%  disk 88% (warn)` (marked `(offline)` or `(WhatsUp not running there)` when so; see Machine load), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
 - `start` and `stop` print one line per port (`3002  herdr   herdr tab jds2 portal in h2`). `stop` acts at once, with no confirmation.
 - `start --wait` then polls until every port it started is up, or `--timeout` seconds (default 180) pass. `--json` prints the server's reply as is.
 - Exit codes: 0 success; 1 the action failed or timed out; 2 usage, unknown row, or WhatsUp not running.
