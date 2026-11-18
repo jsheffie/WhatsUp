@@ -830,8 +830,9 @@ mod tests {
         );
         assert_eq!(params["keys"], json!(["Enter"]));
         assert!(create < rename && rename < send, "{requests:?}");
-        let (read, _) = find(&requests, "pane.read").unwrap();
+        let (read, params) = find(&requests, "pane.read").unwrap();
         assert!(read < send, "waits for the prompt in a new pane");
+        assert_eq!(params["source"], "recent_unwrapped");
         assert_eq!(find(&requests, "tab.create"), None);
     }
 
@@ -936,6 +937,33 @@ mod tests {
         fake.on_type(|_| "listening on 3000".into());
         assert_eq!(launch_web(&client), Ok("herdr tab web in h2".into()));
         assert_eq!(typed(&fake.requests()).len(), 1);
+    }
+
+    #[test]
+    fn launch_reads_a_narrow_pane_unwrapped() {
+        // In a 20-column split both the echoed line and the marker wrap on
+        // screen; read unwrapped, the lines between them are still exact.
+        let (fake, client) = fake_herdr();
+        let ws = fake.add_workspace(1, "h2");
+        let (_, pane) = fake.add_tab(&ws, "web");
+        fake.set_text(&pane, "old scrollback line\n% ");
+        fake.set_width(&pane, 20);
+        fake.on_type(|line| format!("a\n\nboom\n[whatsup {}] exited with 7", nonce_of(line)));
+        assert_eq!(
+            launch_web(&client),
+            Err("npm start exited with 7: a / boom".into())
+        );
+        let reads: Vec<Value> = fake
+            .requests()
+            .into_iter()
+            .filter(|(method, _)| method == "pane.read")
+            .map(|(_, params)| params["source"].clone())
+            .collect();
+        assert!(!reads.is_empty());
+        assert!(
+            reads.iter().all(|source| source == "recent_unwrapped"),
+            "{reads:?}"
+        );
     }
 
     #[test]

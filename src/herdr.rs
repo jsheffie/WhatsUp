@@ -278,12 +278,13 @@ impl HerdrClient {
         Ok(shell.is_some() && shell == foreground)
     }
 
-    /// The last `lines` lines of `pane`.
+    /// The last `lines` lines of `pane`, as printed: soft-wrapped rows are
+    /// joined back, so a line longer than the pane is still one line.
     pub fn read(&self, pane: &str, lines: u32) -> Result<String, CallError> {
         let method = "pane.read";
         let result = self.call(
             method,
-            json!({ "pane_id": pane, "source": "recent", "lines": lines }),
+            json!({ "pane_id": pane, "source": "recent_unwrapped", "lines": lines }),
         )?;
         text_at(&result, "/read/text", method)
     }
@@ -465,6 +466,8 @@ pub(crate) mod testing {
         shell_pid: Option<u32>,
         foreground: Option<u32>,
         text: String,
+        /// Columns `recent` reads wrap at; `None` never wraps.
+        width: Option<usize>,
     }
 
     #[derive(Default)]
@@ -510,6 +513,7 @@ pub(crate) mod testing {
                 shell_pid: Some(SHELL_PID),
                 foreground: Some(SHELL_PID),
                 text: PROMPT.into(),
+                width: None,
             });
             pane
         }
@@ -618,8 +622,30 @@ pub(crate) mod testing {
                 }
                 "pane.read" => {
                     let lines = params["lines"].as_u64().unwrap_or(u64::MAX) as usize;
+                    let source = text("source");
                     let pane = self.pane(&text("pane_id"))?;
-                    let all: Vec<&str> = pane.text.split('\n').collect();
+                    // `recent` gives screen rows, soft-wrapped at the pane's
+                    // width; `recent_unwrapped` gives the logical lines.
+                    let all: Vec<String> = match (source.as_str(), pane.width) {
+                        ("recent", Some(width)) => pane
+                            .text
+                            .split('\n')
+                            .flat_map(|line| {
+                                let chars: Vec<char> = line.chars().collect();
+                                match chars.is_empty() {
+                                    true => vec![String::new()],
+                                    false => chars
+                                        .chunks(width)
+                                        .map(|row| row.iter().collect())
+                                        .collect(),
+                                }
+                            })
+                            .collect(),
+                        ("recent" | "recent_unwrapped", _) => {
+                            pane.text.split('\n').map(String::from).collect()
+                        }
+                        (other, _) => return Err(format!("unknown source {other}")),
+                    };
                     let recent = all[all.len().saturating_sub(lines)..].join("\n");
                     Ok(
                         json!({ "type": "pane_read", "read": { "pane_id": pane.id, "text": recent } }),
@@ -712,6 +738,11 @@ pub(crate) mod testing {
         /// Sets what `pane` shows.
         pub fn set_text(&self, pane: &str, text: &str) {
             self.state().pane(pane).unwrap().text = text.into();
+        }
+
+        /// Makes `recent` reads of `pane` wrap at `columns`.
+        pub fn set_width(&self, pane: &str, columns: usize) {
+            self.state().pane(pane).unwrap().width = Some(columns);
         }
 
         /// Sets the output a typed line produces, from that line.
