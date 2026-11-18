@@ -5,6 +5,7 @@ pub mod instance;
 pub mod probe;
 pub mod server;
 pub mod socks;
+pub mod start;
 pub mod stop;
 pub mod tunnel;
 
