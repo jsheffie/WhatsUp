@@ -168,6 +168,9 @@
     .banner.show { display: block; }
     .banner.dismissable { cursor: pointer; }
 
+    /* A table wider than the screen scrolls inside this box, not the page. */
+    .table-scroll { overflow-x: auto; }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -344,6 +347,18 @@
     footer code {
       color: var(--text);
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    /* Phones: a 16px gutter, and nothing wider than the screen but the
+       tables (which scroll in their boxes) and the tabs (which scroll too). */
+    @media (max-width: 640px) {
+      header { padding: 16px 16px 0; }
+      main { padding: 16px 16px 32px; }
+      .title-row { flex-wrap: wrap; align-items: center; }
+      .actions { padding-bottom: 0; }
+      nav.tabs { overflow-x: auto; }
+      nav.tabs button { flex: 0 0 auto; white-space: nowrap; }
     }
   </style>
 </head>
@@ -573,7 +588,10 @@
             heading.appendChild(note);
           }
         }
-        panel.append(heading, buildTable(group, machine));
+        const scroller = document.createElement("div");
+        scroller.className = "table-scroll";
+        scroller.appendChild(buildTable(group, machine));
+        panel.append(heading, scroller);
         tablesEl.appendChild(panel);
       });
       applyGroupVisibility();
@@ -759,27 +777,34 @@
     function paintActions(key, root = document) {
       const state = rowState.get(key) || "";
       const busy = state === "stopping" || state === "starting-request";
-      root.querySelectorAll("button.start, button.stop").forEach((button) => {
-        if (button.dataset.key !== key) return;
-        const blocked = button.dataset.blocked || "";
-        const label = button.querySelector(".label");
-        if (button.classList.contains("start")) {
-          const starting = state === "starting-request" || startWatch.has(key);
-          button.className = "start " + (starting ? "starting" : "idle");
-          button.disabled = starting || busy || Boolean(blocked);
-          label.textContent = starting ? "Starting..." : "Start";
-          button.title = starting || busy ? "" : blocked || "Start whatever of this row is not running";
-          return;
-        }
+      root.querySelectorAll(".row-actions").forEach((wrap) => {
+        const start = wrap.querySelector("button.start");
+        const stop = wrap.querySelector("button.stop");
+        if (start.dataset.key !== key) return;
+
+        const stopBlocked = stop.dataset.blocked || "";
         // Nothing left to confirm once the row cannot be stopped.
-        const stop = state === "stopping" ? "stopping" : state === "armed" && !blocked ? "armed" : "idle";
-        button.className = "stop " + stop;
-        button.disabled = busy || (stop === "idle" && Boolean(blocked));
-        label.textContent = stop === "armed" ? "Confirm" : stop === "stopping" ? "Stopping..." : "Stop";
-        button.title =
+        const stopShows = state === "stopping" ? "stopping" : state === "armed" && !stopBlocked ? "armed" : "idle";
+        stop.className = "stop " + stopShows;
+        stop.disabled = busy || (stopShows === "idle" && Boolean(stopBlocked));
+        stop.querySelector(".label").textContent =
+          stopShows === "armed" ? "Confirm" : stopShows === "stopping" ? "Stopping..." : "Stop";
+        stop.title =
           busy ? "" :
-          stop === "armed" ? "Click again to stop everything on this row's ports" :
-          blocked || "Stop everything on this row's ports";
+          stopShows === "armed" ? "Click again to stop everything on this row's ports" :
+          stopBlocked || "Stop everything on this row's ports";
+
+        // An armed Stop waits for its confirming click; Start waits for it.
+        const armed = stopShows === "armed";
+        const startBlocked = start.dataset.blocked || "";
+        const starting = state === "starting-request" || startWatch.has(key);
+        start.className = "start " + (starting ? "starting" : "idle");
+        start.disabled = starting || busy || armed || Boolean(startBlocked);
+        start.querySelector(".label").textContent = starting ? "Starting..." : "Start";
+        start.title =
+          starting || busy ? "" :
+          armed ? "Confirm or wait for Stop first" :
+          startBlocked || "Start whatever of this row is not running";
       });
     }
 
@@ -832,7 +857,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(request),
         });
-        const payload = await response.json().catch(() => ({}));
+        const payload = (await response.json().catch(() => null)) || {};
         if (!response.ok) notice("action", "Start failed: " + (payload.error || "status " + response.status));
         // A failed reply may still have started some ports: watch those too.
         started = (payload.results || [])
@@ -865,7 +890,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(request),
         });
-        const payload = await response.json().catch(() => ({}));
+        const payload = (await response.json().catch(() => null)) || {};
         if (!response.ok) notice("action", "Stop failed: " + (payload.error || "status " + response.status));
       } catch (err) {
         notice("action", "Stop failed: could not reach WhatsUp");
@@ -882,7 +907,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url, machine }),
         });
-        const payload = await response.json();
+        const payload = (await response.json().catch(() => null)) || {};
         notice("action", response.ok ? "" : payload.error || "Could not open the browser");
       } catch (err) {
         notice("action", "Could not reach WhatsUp");
