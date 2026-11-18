@@ -4,6 +4,7 @@ pub mod config;
 pub mod herdr;
 pub mod http;
 pub mod instance;
+pub mod load;
 pub mod probe;
 pub mod server;
 pub mod socks;
