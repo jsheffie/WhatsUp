@@ -5,6 +5,7 @@ pub mod instance;
 pub mod probe;
 pub mod server;
 pub mod socks;
+pub mod stop;
 pub mod tunnel;
 
 pub const DEFAULT_CONFIG_JSON: &str = include_str!("../config/whatsup.json");

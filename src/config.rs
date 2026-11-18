@@ -33,6 +33,9 @@ pub struct Remote {
     pub socks_port: u16,
     /// Absolute path of the remote's herdr socket, forwarded over the tunnel.
     pub herdr_socket: Option<String>,
+    /// Where the remote machine's own WhatsUp listens (on its loopback);
+    /// stops of its rows are forwarded there.
+    pub whatsup_port: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +55,19 @@ pub struct Row {
 }
 
 impl Row {
+    /// The distinct ports of the row's links, ascending.
+    pub fn ports(&self) -> Vec<u16> {
+        let ports: BTreeSet<u16> = self
+            .cells
+            .iter()
+            .filter_map(|cell| match cell {
+                Cell::Link(link) => Some(link.port),
+                _ => None,
+            })
+            .collect();
+        ports.into_iter().collect()
+    }
+
     pub fn shown_on(&self, machine: &str) -> bool {
         self.machines.as_ref().is_none_or(|machines| {
             machines
@@ -319,6 +335,8 @@ struct RawRemote {
     socks_port: Option<u16>,
     #[serde(default)]
     herdr_socket: Option<String>,
+    #[serde(default)]
+    whatsup_port: Option<u16>,
 }
 
 impl RawRemote {
@@ -358,12 +376,17 @@ impl RawRemote {
                 ));
             }
         }
+        let whatsup_port = self.whatsup_port.unwrap_or(crate::PREFERRED_PORT);
+        if whatsup_port == 0 {
+            return Err(format!("{at} whatsup_port must be a tcp port"));
+        }
         Ok(Remote {
             name: self.name,
             ssh: self.ssh,
             browser_profile: self.browser_profile,
             socks_port,
             herdr_socket: self.herdr_socket,
+            whatsup_port,
         })
     }
 }
@@ -803,6 +826,7 @@ mod tests {
                 browser_profile: "megan:Lucy".into(),
                 socks_port: 47655,
                 herdr_socket: None,
+                whatsup_port: 47654,
             }]
         );
         assert_eq!(DEFAULT_SOCKS_PORT, 47655);
@@ -812,6 +836,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(custom.remotes[0].socks_port, 40000);
+        let moved = parse_config(&with_top_level(
+            r#""remotes": [{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "whatsup_port": 5000 }],"#,
+        ))
+        .unwrap();
+        assert_eq!(moved.remotes[0].whatsup_port, 5000);
         assert_eq!(custom.remote("lucy").unwrap().socks_port, 40000);
         assert!(custom.remote("megan").is_none());
     }
@@ -828,6 +857,7 @@ mod tests {
             r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "socks_port": 0 }"#,
             r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "socks_port": 47654 }"#,
             r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "extra": 1 }"#,
+            r#"{ "name": "lucy", "ssh": "lucy", "browser_profile": "P", "whatsup_port": 0 }"#,
         ];
         for remotes in bad {
             let text = with_top_level(&format!(r#""remotes": [{remotes}],"#));
@@ -897,6 +927,28 @@ mod tests {
             );
             assert!(parse_config(&text).is_err(), "accepted {bad}");
         }
+    }
+
+    #[test]
+    fn row_ports_are_distinct_and_sorted() {
+        let config = parse_config(
+            r#"{
+                "groups": [{
+                    "id": "g",
+                    "label": "G",
+                    "columns": ["Name", "A", "B", "C"],
+                    "rows": [{ "cells": [
+                        "stack",
+                        { "label": "admin", "url": "http://localhost:8004/admin/" },
+                        { "label": "portal", "url": "http://localhost:3004" },
+                        { "label": "schema", "url": "http://localhost:8004/schema/" }
+                    ] }, { "cells": ["text only", null, null, null] }]
+                }]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.groups[0].rows[0].ports(), [3004, 8004]);
+        assert!(config.groups[0].rows[1].ports().is_empty());
     }
 
     #[test]
