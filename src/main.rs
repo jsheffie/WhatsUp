@@ -99,8 +99,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         let hostname = short_hostname();
         let local_herdr = whatsup::herdr::local_socket(&|key| env::var_os(key));
         let starter = SystemStarter::new(local_herdr.clone(), config.machine_label(&hostname));
-        // Disk use is that of the filesystem holding the home folder: on
-        // macOS `/` is the sealed system volume, not the one that fills up.
+        // Disk use is that of the filesystem holding the home folder, where
+        // stacks and their images live. On macOS's APFS that is the shared
+        // container, so it counts every volume's use.
         let home = env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
         let monitor = LoadMonitor::start(home);
         let state = AppState::new(

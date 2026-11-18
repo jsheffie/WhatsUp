@@ -135,7 +135,7 @@ Under the summary, each machine has a line with its CPU, RAM and disk use, refre
 |---|---|---|---|
 | CPU | percent busy across all cores, averaged over 10 s | 75% | 90% |
 | RAM | percent in use, meaning not available: Linux `MemAvailable`, macOS the kernel's memory pressure level (as `memory_pressure` prints it) | 80% | 90% |
-| Disk | percent not available on the filesystem holding your home folder (the data volume on macOS, not the sealed `/`) | 85% | 95% |
+| Disk | percent not available on the filesystem holding your home folder (on macOS, the APFS container all its volumes share, so `df -h /` shows a smaller "Used" for the system volume alone) | 85% | 95% |
 
 - Hover a number for details: core count, total memory and swap in use, free space.
 - Each WhatsUp samples its own machine every 2 s and serves it at `GET /api/load`. A remote's numbers come from its own WhatsUp through the tunnel, so that machine needs this version too. Until it has it, its line says `update WhatsUp on <name> to see its load`.

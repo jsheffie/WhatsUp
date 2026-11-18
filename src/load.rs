@@ -366,28 +366,40 @@ fn one_decimal(percent: f64) -> f64 {
     (percent * 10.0).round() / 10.0
 }
 
+/// A percent as shown, with the level of that same number, so a value never
+/// reads as at a threshold its level says it has not reached.
+fn shown(percent: f64, warn: f64, high: f64) -> (f64, &'static str) {
+    let percent = one_decimal(percent);
+    (percent, level(percent, warn, high).as_str())
+}
+
 /// A sample as the dashboard shows it: each part with its level, a missing
 /// part as `null`.
 pub fn view(load: &Load) -> Value {
     json!({
-        "cpu": load.cpu.as_ref().map(|cpu| json!({
-            "percent": one_decimal(cpu.percent),
-            "cores": cpu.cores,
-            "level": level(cpu.percent, CPU_WARN, CPU_HIGH).as_str(),
-        })),
-        "memory": load.memory.as_ref().map(|memory| json!({
-            "percent": one_decimal(memory.percent),
-            "total": memory.total,
-            "swap_used": memory.swap_used,
-            "level": level(memory.percent, MEMORY_WARN, MEMORY_HIGH).as_str(),
-        })),
-        "disk": load.disk.as_ref().map(|disk| json!({
-            "percent": one_decimal(disk.percent),
-            "total": disk.total,
-            "free": disk.free,
-            "path": disk.path,
-            "level": level(disk.percent, DISK_WARN, DISK_HIGH).as_str(),
-        })),
+        "cpu": load.cpu.as_ref().map(|cpu| {
+            let (percent, level) = shown(cpu.percent, CPU_WARN, CPU_HIGH);
+            json!({ "percent": percent, "cores": cpu.cores, "level": level })
+        }),
+        "memory": load.memory.as_ref().map(|memory| {
+            let (percent, level) = shown(memory.percent, MEMORY_WARN, MEMORY_HIGH);
+            json!({
+                "percent": percent,
+                "total": memory.total,
+                "swap_used": memory.swap_used,
+                "level": level,
+            })
+        }),
+        "disk": load.disk.as_ref().map(|disk| {
+            let (percent, level) = shown(disk.percent, DISK_WARN, DISK_HIGH);
+            json!({
+                "percent": percent,
+                "total": disk.total,
+                "free": disk.free,
+                "path": disk.path,
+                "level": level,
+            })
+        }),
     })
 }
 
@@ -542,6 +554,20 @@ mod tests {
         };
         assert_eq!(window.push(busy), Some(100.0 * 600.0 / 600.0));
         assert_eq!(window.oldest(), Some(tick(100)));
+    }
+
+    #[test]
+    fn level_follows_the_percent_shown() {
+        let load = Load {
+            cpu: Some(Cpu {
+                percent: 74.96,
+                cores: 12,
+            }),
+            ..Default::default()
+        };
+        let view = view(&load);
+        assert_eq!(view["cpu"]["percent"], 75.0);
+        assert_eq!(view["cpu"]["level"], "warn");
     }
 
     #[test]

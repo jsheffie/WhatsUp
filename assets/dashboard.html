@@ -85,6 +85,8 @@
     .load.single { grid-template-columns: repeat(3, max-content); }
     .load:empty { display: none; }
     .load-line { display: contents; }
+    /* Each machine starts a row, even one showing only its tag. */
+    .load-line > :first-child { grid-column-start: 1; }
     .load .tag { justify-self: start; }
     .load .note { grid-column: span 3; }
 
@@ -416,7 +418,7 @@
       <div>
         <h1 id="title">WhatsUp</h1>
         <p class="summary" id="summary">Checking local ports…</p>
-        <div class="load" id="load" aria-label="Machine load"></div>
+        <div class="load" id="load" role="group" aria-label="Machine load"></div>
       </div>
       <div class="actions">
         <label class="toggle">
@@ -579,24 +581,57 @@
       return Math.floor(part.percent) + "%";
     }
 
-    function metric(name, part, tooltip) {
+    const METRICS = [
+      { key: "cpu", name: "CPU", tooltip: (cpu) => "10 s average across " + cpu.cores + " cores" },
+      {
+        key: "memory",
+        name: "RAM",
+        tooltip: (memory) =>
+          percent(memory) + " in use of " + formatBytes(memory.total) +
+          (memory.swap_used > 0 ? " · swap " + formatBytes(memory.swap_used) + " used" : ""),
+      },
+      {
+        key: "disk",
+        name: "Disk",
+        tooltip: (disk) => disk.path + " · " + formatBytes(disk.free) + " free of " + formatBytes(disk.total),
+      },
+    ];
+
+    // A machine's load as shown, or null when only a note (or nothing) is.
+    function shownLoad(machine) {
+      return machine.offline ? null : machine.load || null;
+    }
+
+    // What the load line's nodes depend on. Only a change here rebuilds
+    // them; numbers are patched in place, so a tooltip or a selection
+    // survives the refresh.
+    function loadShape(machines, multi) {
+      return JSON.stringify([multi, machines.map((machine) => {
+        const load = shownLoad(machine);
+        return [
+          machine.name,
+          machine.local,
+          load ? METRICS.map((metric) => Boolean(load[metric.key])) : machine.offline ? "offline" : machine.load_note || "",
+        ];
+      })]);
+    }
+
+    function metricEl(metric, present) {
       const el = document.createElement("span");
-      el.className = "metric" + (part ? " " + part.level : "");
+      el.className = "metric";
+      el.dataset.key = metric.key;
       const label = document.createElement("span");
-      label.textContent = name;
+      label.textContent = metric.name;
       const value = document.createElement("span");
       value.className = "value";
-      value.textContent = part ? percent(part) : "-";
+      value.textContent = "-";
       el.append(label, value);
-      if (part) {
+      if (present) {
         const meter = document.createElement("span");
         meter.className = "meter";
         meter.setAttribute("aria-hidden", "true");
-        const fill = document.createElement("span");
-        fill.style.width = Math.min(100, Math.max(0, part.percent)) + "%";
-        meter.appendChild(fill);
+        meter.appendChild(document.createElement("span"));
         el.appendChild(meter);
-        el.title = tooltip(part);
       }
       return el;
     }
@@ -610,34 +645,54 @@
         tag.textContent = machine.name;
         line.appendChild(tag);
       }
-      const load = machine.offline ? null : machine.load;
-      if (!load) {
-        const note = document.createElement("span");
-        note.className = "note";
-        note.textContent = machine.offline ? "offline" : machine.load_note || "load unknown";
-        line.appendChild(note);
-        return line;
+      const load = shownLoad(machine);
+      if (load) {
+        METRICS.forEach((metric) => line.appendChild(metricEl(metric, Boolean(load[metric.key]))));
+      } else {
+        const text = machine.offline ? "offline" : machine.load_note;
+        if (text) {
+          const note = document.createElement("span");
+          note.className = "note";
+          note.textContent = text;
+          line.appendChild(note);
+        }
       }
-      line.append(
-        metric("CPU", load.cpu, (cpu) => "10 s average across " + cpu.cores + " cores"),
-        metric("RAM", load.memory, (memory) =>
-          percent(memory) + " in use of " + formatBytes(memory.total) +
-          (memory.swap_used > 0 ? " · swap " + formatBytes(memory.swap_used) + " used" : "")
-        ),
-        metric("Disk", load.disk, (disk) =>
-          disk.path + " · " + formatBytes(disk.free) + " free of " + formatBytes(disk.total)
-        )
-      );
       return line;
+    }
+
+    function setIfChanged(target, property, value) {
+      if (target[property] !== value) target[property] = value;
+    }
+
+    function updateLine(line, machine) {
+      const load = shownLoad(machine);
+      if (!load) return;
+      METRICS.forEach((metric) => {
+        const part = load[metric.key];
+        const el = line.querySelector('.metric[data-key="' + metric.key + '"]');
+        if (!part || !el) return;
+        setIfChanged(el, "className", "metric " + part.level);
+        setIfChanged(el.querySelector(".value"), "textContent", percent(part));
+        setIfChanged(el, "title", metric.tooltip(part));
+        const width = Math.min(100, Math.max(0, part.percent)) + "%";
+        const fill = el.querySelector(".meter > span");
+        if (fill.style.width !== width) fill.style.width = width;
+      });
     }
 
     // Painted on every refresh, outside the view key: load changes each
     // tick and must not rebuild the tables.
+    let lastLoadShape = "";
     function paintLoad(data) {
       const machines = machinesOf(data);
       const multi = machines.length > 1;
-      loadEl.classList.toggle("single", !multi);
-      loadEl.replaceChildren(...machines.map((machine) => loadLine(machine, multi)));
+      const shape = loadShape(machines, multi);
+      if (shape !== lastLoadShape) {
+        lastLoadShape = shape;
+        loadEl.classList.toggle("single", !multi);
+        loadEl.replaceChildren(...machines.map((machine) => loadLine(machine, multi)));
+      }
+      machines.forEach((machine, index) => updateLine(loadEl.children[index], machine));
     }
 
     function tabButton(filter, label) {

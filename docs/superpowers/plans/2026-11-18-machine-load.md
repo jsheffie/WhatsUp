@@ -40,9 +40,9 @@ below are the design, and the ones marked "my call" are open to change.
   - Swap in use is shown in the tooltip.
 - **Disk:** the filesystem holding `$HOME` (`/` if `HOME` is unset), as
   `100 * (total - available) / total` from `statvfs` (`f_bavail`).
-  - On megan `/` is the sealed system snapshot (27%). The data volume that
-    fills up, and that holds Docker Desktop's disk, is
-    `/System/Volumes/Data` (88% today).
+  - On megan this is the APFS container (88% today). `statvfs` reports
+    container totals, so `/` gives the same number; df's 27% for `/` is
+    that volume's own "Used" only. (Corrected after review.)
   - On lucy, `/`, `/home` and `/var/lib/docker` are one filesystem.
 - **Levels (my call):**
 

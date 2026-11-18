@@ -564,8 +564,6 @@ fn list_json(dashboard: &Value) -> Value {
     json!({ "machines": dashboard["machines"], "rows": list_rows(dashboard) })
 }
 
-/// Per machine, a summary line and then one line per row: its id (or
-/// `group/index`), its first text, and each port up or down with its labels.
 /// A machine's load for its summary line: `  cpu 23%  ram 50%  disk 88%
 /// (warn)`, whole percents rounded down as the dashboard shows them, or the
 /// note saying why it is missing.
@@ -590,6 +588,8 @@ fn format_load(machine: &Value) -> String {
     text
 }
 
+/// Per machine, a summary line and then one line per row: its id (or
+/// `group/index`), its first text, and each port up or down with its labels.
 fn format_list(dashboard: &Value) -> String {
     let rows = list_rows(dashboard);
     let mut blocks = Vec::new();
