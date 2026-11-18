@@ -103,8 +103,8 @@ Every row with links has a Start button beside Stop. It starts whatever of the r
 - A port published by docker: `docker compose -p <project> start` for the compose project of the container that publishes it, or `docker start` for a container outside compose. It uses the existing, stopped containers (they keep their port bindings), so it needs no config. Containers are never created.
 - A link with a `start` in the config: the command runs in a herdr tab named after the link, in the row's herdr workspace (the first one matching the row's `herdr` prefix, created if none matches). A tab with that name is reused when its shell is idle, and refused ("busy; it may still be starting") when it is not; otherwise a tab is created. WhatsUp types this one line into the tab's interactive shell, so aliases like `tt2a` work and the logs stay in the tab:
   `cd -- '<dir>' && { <run>; }; echo "[whatsup <nonce>] exited with $?"`
-- When the command ends within 5 seconds, Start reports its exit code and the last lines of output instead of success.
-- A port with neither is reported as having no start command.
+- When the command ends within 5 seconds, Start reports its exit code and the last lines of output instead of success. If herdr stops answering after the command was typed, Start still reports the port as started, with "could not watch it start".
+- A port with no `start` and no container publishing it fails with "no start command, and no container publishes it". Several containers publishing it fails with "several containers publish it: <names>".
 - The button reads Starting... until every port it started is up, or for 3 minutes, after which the banner names what is still down.
 
 Rows of a remote machine are started by the WhatsUp running on that machine (same tunnel and requirements as Stop). A request names a row, never a command: each WhatsUp runs only commands from its own config.
@@ -153,7 +153,7 @@ whatsup stop  <row> [--machine <name>] [--json] [--port <port>]
 
 - `<row>` is a row `id` (case ignored) or `<group>/<index>` using the config index. `--machine` defaults to this machine.
 - Options go after the command. Before a command, `--port` is the port to listen on; after it, the port of the running WhatsUp.
-- `list` prints each machine's rows with their ports up or down and labels, then `megan 12/33 up`. `--json` prints `{ machines, rows }`.
+- `list` prints, for each machine, a summary line such as `megan 12/33 up` (marked `(offline)` or `(WhatsUp not running there)` when so), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
 - `start` and `stop` print one line per port (`3002  herdr   herdr tab jds2 portal in h2`). `stop` acts at once, with no confirmation.
 - `start --wait` then polls until every port it started is up, or `--timeout` seconds (default 180) pass. `--json` prints the server's reply as is.
 - Exit codes: 0 success; 1 the action failed or timed out; 2 usage, unknown row, or WhatsUp not running.
