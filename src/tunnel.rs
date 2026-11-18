@@ -92,6 +92,7 @@ pub fn is_our_tunnel(command: &str, socks_port: u16) -> bool {
         browser_profile: String::new(),
         socks_port,
         herdr_socket: None,
+        whatsup_port: crate::PREFERRED_PORT,
     })
     .join(" ");
     let Some(tail) = rest
@@ -378,6 +379,7 @@ mod tests {
             // Not the default port: tests must never touch a real tunnel.
             socks_port: 47695,
             herdr_socket: None,
+            whatsup_port: crate::PREFERRED_PORT,
         }
     }
 
