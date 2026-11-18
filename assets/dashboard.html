@@ -24,6 +24,8 @@
       --focus: #ffd166;
       --remote: #d2a8ff;
       --remote-line: #6e40c9;
+      --stop: #d6363f;
+      --stop-hover: #ee4c55;
     }
 
     * { box-sizing: border-box; }
@@ -162,6 +164,7 @@
     }
 
     .banner.show { display: block; }
+    .banner.dismissable { cursor: pointer; }
 
     table {
       width: 100%;
@@ -247,6 +250,72 @@
       font-size: 12px;
     }
 
+    /* The Stop column hugs its button; the links keep the rest. */
+    th.stop-col, td.stop-col {
+      width: 1%;
+      padding-left: 6px;
+      text-align: right;
+      white-space: nowrap;
+    }
+
+    button.stop {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      /* Wide enough for "Stopping...", so the label never resizes it. */
+      min-width: 128px;
+      height: 36px;
+      padding: 0 16px;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--stop);
+      color: #fff;
+      font: inherit;
+      font-weight: 650;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+    }
+
+    button.stop .glyph {
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      flex: 0 0 auto;
+      background: currentColor;
+    }
+
+    button.stop:hover:not(:disabled) { background: var(--stop-hover); }
+
+    button.stop.armed,
+    button.stop.armed:hover:not(:disabled) {
+      background: var(--focus);
+      color: #1b1f24;
+    }
+
+    button.stop:disabled {
+      border-color: var(--line);
+      background: transparent;
+      color: var(--muted);
+      cursor: default;
+    }
+
+    button.stop.idle:disabled { opacity: 0.6; }
+
+    button.stop.stopping { border-color: var(--stop); color: var(--text); }
+    button.stop.stopping .glyph {
+      background: var(--stop);
+      animation: stop-pulse 1s ease-in-out infinite;
+    }
+
+    @keyframes stop-pulse {
+      50% { opacity: 0.25; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      button.stop.stopping .glyph { animation: none; }
+    }
+
     .service:focus-visible, button:focus-visible, input:focus-visible {
       outline: 2px solid var(--focus);
       outline-offset: 2px;
@@ -301,6 +370,15 @@
     let timer = 0;
     let lastView = "";
     let multiMachine = false;
+    // The banner shows one message: a WhatsUp problem, else the config
+    // error, else the last failed stop or open (which stays until the next
+    // one, or a click).
+    const notices = { system: "", config: "", action: "" };
+    // Stop buttons outlive the tables, which are rebuilt whenever the status
+    // changes: "machine/group/index" -> "armed" | "stopping".
+    const stopState = new Map();
+    const armTimers = new Map();
+    const ARMED_MS = 4000;
     upOnlyEl.checked = localStorage.getItem("whatsup-up-only") === "1";
 
     // Tabs filter sections: "all", "machine:<name>" or "group:<id>". Older
@@ -312,22 +390,31 @@
 
     upOnlyEl.addEventListener("change", () => {
       localStorage.setItem("whatsup-up-only", upOnlyEl.checked ? "1" : "0");
-      const buttons = document.querySelectorAll("#tables tbody tr");
-      buttons.forEach(applyUpOnly);
+      document.querySelectorAll("#tables tbody tr").forEach(applyUpOnly);
+      applyGroupVisibility();
     });
 
     quitEl.addEventListener("click", async () => {
       quitEl.disabled = true;
       clearTimeout(timer);
       await fetch("/api/quit", { method: "POST" });
-      banner("WhatsUp stopped. You can close this tab.");
+      notice("system", "WhatsUp stopped. You can close this tab.");
       summaryEl.textContent = "Stopped";
     });
 
-    function banner(text) {
-      bannerEl.textContent = text;
-      bannerEl.classList.toggle("show", Boolean(text));
+    function notice(kind, text) {
+      notices[kind] = text || "";
+      const shown = notices.system || notices.config || notices.action;
+      bannerEl.textContent = shown;
+      bannerEl.classList.toggle("show", Boolean(shown));
+      const dismissable = Boolean(shown) && shown === notices.action;
+      bannerEl.classList.toggle("dismissable", dismissable);
+      bannerEl.title = dismissable ? "Click to dismiss" : "";
     }
+
+    bannerEl.addEventListener("click", () => {
+      if (bannerEl.classList.contains("dismissable")) notice("action", "");
+    });
 
     function shows(panel) {
       if (activeFilter === "all") return true;
@@ -341,7 +428,11 @@
       });
       let first = true;
       document.querySelectorAll("#tables > .panel").forEach((panel) => {
-        panel.hidden = !shows(panel);
+        // "Up only" can hide every row of a table; a bare header row says
+        // nothing, so the whole section goes.
+        const rows = [...panel.querySelectorAll("tbody tr")];
+        const empty = rows.length > 0 && rows.every((row) => row.classList.contains("hidden"));
+        panel.hidden = !shows(panel) || empty;
         panel.classList.toggle("first", !panel.hidden && first);
         if (!panel.hidden) first = false;
         // With one machine a group tab shows just its table, as it always has.
@@ -406,7 +497,8 @@
       document.title = title;
       titleEl.textContent = title;
       paintSummary(data);
-      banner(data.config_error || "");
+      notice("system", "");
+      notice("config", data.config_error || "");
       const nextView = viewKey(data);
       if (nextView === lastView) return;
       lastView = nextView;
@@ -480,6 +572,11 @@
         th.textContent = column;
         headRow.appendChild(th);
       });
+      const stopHead = document.createElement("th");
+      stopHead.scope = "col";
+      stopHead.className = "stop-col";
+      stopHead.setAttribute("aria-label", "Stop");
+      headRow.appendChild(stopHead);
       head.appendChild(headRow);
       table.appendChild(head);
 
@@ -492,6 +589,7 @@
           tr.className = row.tone === "black" ? "black" : "gray";
           tr.classList.toggle("all-up", allUp);
           row.cells.forEach((cell) => tr.appendChild(renderCell(cell, machine)));
+          tr.appendChild(renderStopCell(group, row, machine));
           applyUpOnly(tr);
           body.appendChild(tr);
         });
@@ -557,6 +655,88 @@
       return td;
     }
 
+    function renderStopCell(group, row, machine) {
+      const td = document.createElement("td");
+      td.className = "stop-col";
+      const ports = row.ports || [];
+      if (!ports.length) return td;
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.key = machine.name + "/" + group.id + "/" + row.index;
+      const glyph = document.createElement("span");
+      glyph.className = "glyph";
+      glyph.setAttribute("aria-hidden", "true");
+      const label = document.createElement("span");
+      label.className = "label";
+      button.append(glyph, label);
+
+      // Why the row cannot be stopped right now, if so.
+      const anyUp = row.cells.some((cell) => cell && cell.type === "link" && cell.up);
+      if (machine.offline) button.dataset.blocked = machine.note || machine.name + " is offline";
+      else if (machine.can_stop === false) button.dataset.blocked = "Start WhatsUp on " + machine.name + " to stop its stacks";
+      else if (!anyUp) button.dataset.blocked = "Nothing is running";
+
+      button.addEventListener("click", () => stopClicked(button, {
+        machine: machine.name,
+        group: group.id,
+        row: row.index,
+        ports,
+      }));
+      paintStop(button);
+      td.appendChild(button);
+      return td;
+    }
+
+    function paintStop(button) {
+      const blocked = button.dataset.blocked || "";
+      let state = stopState.get(button.dataset.key) || "idle";
+      // Nothing left to confirm once the row cannot be stopped.
+      if (state === "armed" && blocked) state = "idle";
+      button.className = "stop " + state;
+      button.disabled = state === "stopping" || (state === "idle" && Boolean(blocked));
+      button.querySelector(".label").textContent =
+        state === "armed" ? "Confirm" : state === "stopping" ? "Stopping..." : "Stop";
+      button.title =
+        state === "stopping" ? "" :
+        state === "armed" ? "Click again to stop everything on this row's ports" :
+        blocked || "Stop everything on this row's ports";
+    }
+
+    function setStopState(key, state) {
+      clearTimeout(armTimers.get(key));
+      armTimers.delete(key);
+      if (state) stopState.set(key, state);
+      else stopState.delete(key);
+      document.querySelectorAll("button.stop").forEach((button) => {
+        if (button.dataset.key === key) paintStop(button);
+      });
+    }
+
+    async function stopClicked(button, request) {
+      const key = button.dataset.key;
+      if (stopState.get(key) !== "armed") {
+        setStopState(key, "armed");
+        armTimers.set(key, setTimeout(() => setStopState(key, null), ARMED_MS));
+        return;
+      }
+      setStopState(key, "stopping");
+      notice("action", "");
+      try {
+        const response = await fetch("/api/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) notice("action", "Stop failed: " + (payload.error || "status " + response.status));
+      } catch (err) {
+        notice("action", "Stop failed: could not reach WhatsUp");
+      } finally {
+        setStopState(key, null);
+      }
+    }
+
     async function openLink(button, url, machine) {
       button.disabled = true;
       try {
@@ -566,10 +746,9 @@
           body: JSON.stringify({ url, machine }),
         });
         const payload = await response.json();
-        if (!response.ok) banner(payload.error || "Could not open the browser");
-        else banner("");
+        notice("action", response.ok ? "" : payload.error || "Could not open the browser");
       } catch (err) {
-        banner("Could not reach WhatsUp");
+        notice("action", "Could not reach WhatsUp");
       } finally {
         button.disabled = false;
       }
@@ -584,7 +763,7 @@
         paintSummary(data);
         timer = setTimeout(refresh, data.refresh_ms || 2000);
       } catch (err) {
-        banner("WhatsUp is not responding");
+        notice("system", "WhatsUp is not responding");
         timer = setTimeout(refresh, 2000);
       }
     }

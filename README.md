@@ -84,6 +84,18 @@ One-time profile setup:
 1. Create a Chrome profile with the `browser_profile` name. It does not need to be signed in to Chrome.
 2. In that profile, open `chrome://extensions`, turn on Developer mode, choose Load unpacked, and pick `extension/remote-proxy` from this repo. If you change `socks_port`, change `SOCKS_PORT` in `extension/remote-proxy/background.js` to match.
 
+## Stopping a stack
+
+Every row with links has a Stop button. Click it, then click Confirm within 4 seconds. Stop means "stop whatever serves this row's ports":
+
+- A port published by docker: `docker compose -p <project> stop` for the container's compose project (so its database and other services stop too), or `docker stop` for a container outside compose. Containers are stopped, never removed.
+- Any other listener: SIGTERM to its process group, then SIGKILL if the port is still open after 5 seconds. The group is the server plus the `npm` / `just` / `pnpm` that started it, not the shell or terminal it was started from. When the group also holds unrelated processes, only the listener itself is signalled.
+- Only ports whose links point at the machine itself (`localhost`, or a name that resolves to loopback there) are stopped.
+
+Things the dashboard has no port for are not found: a second dev server on another port, a container without a published port, or the database of a compose project whose web container is already down.
+
+Rows of a remote machine are stopped by the WhatsUp running on that machine: the request goes through the remote's tunnel to its WhatsUp on `127.0.0.1:47654`. So WhatsUp must be running there, in the same version or newer, with the same config. Add `"whatsup_port": <port>` to the remote's entry if its WhatsUp was started with `--port`. When the remote's WhatsUp does not answer, its Stop buttons are disabled and say so.
+
 ## herdr workspace labels
 
 When a stack runs in its own herdr workspace, the dashboard can show that workspace's name next to the stack: the Workspace cell `jds` reads `jds/h1-herberth`.
