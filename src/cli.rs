@@ -1398,11 +1398,9 @@ jeeves 0/0 up (offline)
 
     #[test]
     fn no_whatsup_exits_2() {
-        let closed = {
-            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-            listener.local_addr().unwrap().port()
-        };
-        let port = closed.to_string();
+        // Port 1 needs root to bind and is never handed out as an ephemeral
+        // port, so unlike a freed port no test running in parallel can take it.
+        let port = "1".to_string();
         for args in [
             &["list", "--port", &port][..],
             &["start", "jds2", "--port", &port],

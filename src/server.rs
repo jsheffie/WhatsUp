@@ -1910,11 +1910,49 @@ mod tests {
         assert!(is_up("localhost", v4_port));
         // A vite on ::1 only, behind 127.0.0.1: its link host misses it, and
         // the dashboard's own probe (both loopbacks) still sees it.
-        let v6 = StdListener::bind("[::1]:0").unwrap();
-        let v6_port = v6.local_addr().unwrap().port();
+        // 127.0.0.1 on that port is held bound and not listening, so a
+        // parallel test cannot be handed it and start answering there.
+        let (_v6, v6_port, _v4_closed) = loop {
+            let v6 = StdListener::bind("[::1]:0").unwrap();
+            let port = v6.local_addr().unwrap().port();
+            if let Some(closed) = bind_without_listening(port) {
+                break (v6, port, closed);
+            }
+        };
         assert!(!link_is_up("127.0.0.1", v6_port));
         assert!(is_up("127.0.0.1", v6_port));
         assert!(!is_up("localhost", 1));
+    }
+
+    /// Binds 127.0.0.1:`port` without listening: connects there are
+    /// refused, and nothing else can bind it while the socket lives. None
+    /// when the port is taken.
+    fn bind_without_listening(port: u16) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let size = std::mem::size_of::<libc::sockaddr_in>();
+        // SAFETY: a fresh descriptor, owned at once, and a zeroed
+        // sockaddr_in filled in field by field and passed with its size.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                return None;
+            }
+            let socket = OwnedFd::from_raw_fd(fd);
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            #[cfg(target_os = "macos")]
+            {
+                address.sin_len = size as u8;
+            }
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_port = port.to_be();
+            address.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+            let bound = libc::bind(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                size as libc::socklen_t,
+            );
+            (bound == 0).then_some(socket)
+        }
     }
 
     const JDS2: &str = r#"{"group":"pc","row":0,"ports":[3002,4002,8002]}"#;

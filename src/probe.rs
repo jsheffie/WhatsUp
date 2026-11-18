@@ -39,7 +39,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(port_is_open(port));
-        drop(listener);
-        assert!(!port_is_open(port));
+        // Not the freed port, which a test running in parallel may be handed:
+        // port 1 needs root to bind and is never an ephemeral port.
+        assert!(!port_is_open(1));
     }
 }
