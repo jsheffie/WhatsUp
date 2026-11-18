@@ -118,6 +118,19 @@ pub fn post_json(
     exchange(stream, "POST", port, path, Some(body), read_timeout)
 }
 
+/// GETs `path` from the WhatsUp listening on the remote machine's loopback
+/// `port`, through the tunnel, and returns the status and body of its reply.
+pub fn get_json(
+    socks_port: u16,
+    port: u16,
+    path: &str,
+    read_timeout: Duration,
+) -> Result<(u16, String), PostError> {
+    let stream = socks_connect(socks_port, "127.0.0.1", port, REMOTE_TIMEOUT)
+        .map_err(|_| PostError::Connect)?;
+    exchange(stream, "GET", port, path, None, read_timeout)
+}
+
 /// Probes every distinct (host, port) through the tunnel at once.
 pub fn probe_remote(
     socks_port: u16,
