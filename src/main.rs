@@ -11,7 +11,8 @@ use tokio::sync::watch;
 use whatsup::browser::open_in_browser;
 use whatsup::config::{config_dir, load_config, resolve_config_path, runtime_dir};
 use whatsup::instance;
-use whatsup::server::{router, AppState, SystemOpener};
+use whatsup::server::{router, Actions, AppState, SystemOpener};
+use whatsup::stop::SystemStopper;
 use whatsup::tunnel::Tunnels;
 use whatsup::PREFERRED_PORT;
 
@@ -89,7 +90,10 @@ fn run() -> Result<(), String> {
         let state = AppState::new(
             config_path,
             config.clone(),
-            Arc::new(SystemOpener),
+            Actions {
+                opener: Arc::new(SystemOpener),
+                stopper: Arc::new(SystemStopper::new()),
+            },
             shutdown_tx,
             short_hostname(),
             tunnels.clone(),

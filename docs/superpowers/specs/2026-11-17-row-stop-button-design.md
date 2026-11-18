@@ -127,7 +127,9 @@ stopping vite). Worst case for one request is about 70 s.
 A port is only stopped when every link of the row on that port names this
 machine: its host resolves, on the machine doing the stop, to loopback
 addresses only (`localhost`, `jds4.local.me`). Otherwise that port fails
-with "port N: <host> is not this machine" and nothing is signalled for it.
+with "port N: <host> is not this machine" (or "does not resolve on this
+machine") and nothing is signalled for it. The row's other ports are still
+stopped.
 
 A stop, once started, runs to the end even if the HTTP client goes away
 (tab reload, the forwarding WhatsUp timing out). The "already stopping"
@@ -183,6 +185,14 @@ is not found, step 1 finds nothing.
     cannot stop stacks; update it" }`;
   - connected, but no complete reply within 90 s: `502 { "error": "lucy did
     not answer in time; it may still be stopping" }`.
+- An error relayed from the remote is prefixed with its name (`lucy: port
+  8004: ...`). The remote's "config changed" 409 is reworded, because this
+  dashboard already checked the row against its own config: "lucy's WhatsUp
+  has a different config for that row; update the config on both machines".
+- The "already stopping" guard is kept by the machine that does the stop,
+  not by the forwarder.
+- A body that is not a valid request gets a JSON `400` like the other
+  errors (the handler parses it itself).
 - Machine names are compared ignoring ASCII case, as `shown_on` does.
 - New optional remote field `whatsup_port` (default 47654, the port WhatsUp
   prefers), for a remote WhatsUp started with `--port`.

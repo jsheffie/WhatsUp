@@ -646,7 +646,8 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let report = PathBuf::from(report);
-        let partial = report.with_extension("partial");
+        let mut partial = report.clone().into_os_string();
+        partial.push(".partial");
         std::fs::write(&partial, format!("{port} {}", std::process::id())).unwrap();
         std::fs::rename(partial, report).unwrap();
         std::thread::sleep(Duration::from_secs(120));
