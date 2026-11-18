@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
+pub const CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// A port is up when localhost accepts a TCP connection on IPv4 or IPv6.
 pub fn port_is_open(port: u16) -> bool {

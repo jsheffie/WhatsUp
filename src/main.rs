@@ -12,6 +12,7 @@ use whatsup::browser::open_in_browser;
 use whatsup::config::{config_dir, load_config, resolve_config_path, runtime_dir};
 use whatsup::instance;
 use whatsup::server::{router, Actions, AppState, SystemOpener};
+use whatsup::start::SystemStarter;
 use whatsup::stop::SystemStopper;
 use whatsup::tunnel::Tunnels;
 use whatsup::PREFERRED_PORT;
@@ -87,17 +88,21 @@ fn run() -> Result<(), String> {
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let tunnels = Arc::new(Tunnels::new(PathBuf::from("ssh"), runtime_dir.clone()));
+        let hostname = short_hostname();
+        let local_herdr = whatsup::herdr::local_socket(&|key| env::var_os(key));
+        let starter = SystemStarter::new(local_herdr.clone(), config.machine_label(&hostname));
         let state = AppState::new(
             config_path,
             config.clone(),
             Actions {
                 opener: Arc::new(SystemOpener),
                 stopper: Arc::new(SystemStopper::new()),
+                starter: Arc::new(starter),
             },
             shutdown_tx,
-            short_hostname(),
+            hostname,
             tunnels.clone(),
-            whatsup::herdr::local_socket(&|key| env::var_os(key)),
+            local_herdr,
         );
         let app = router(state);
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {

@@ -674,7 +674,7 @@
       // Why the row cannot be stopped right now, if so.
       const anyUp = row.cells.some((cell) => cell && cell.type === "link" && cell.up);
       if (machine.offline) button.dataset.blocked = machine.note || machine.name + " is offline";
-      else if (machine.can_stop === false) button.dataset.blocked = "Start WhatsUp on " + machine.name + " to stop its stacks";
+      else if (machine.can_act === false) button.dataset.blocked = "Start WhatsUp on " + machine.name + " to stop its stacks";
       else if (!anyUp) button.dataset.blocked = "Nothing is running";
 
       button.addEventListener("click", () => stopClicked(button, {
