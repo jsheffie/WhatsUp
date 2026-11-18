@@ -26,6 +26,12 @@
       --remote-line: #6e40c9;
       --stop: #d6363f;
       --stop-hover: #ee4c55;
+      --start: #1a7f46;
+      --start-hover: #23a35b;
+      /* Disabled pills: translucent, so they show on every row tone, the
+         green up-tint included. */
+      --disabled-line: rgba(255, 255, 255, 0.24);
+      --disabled-text: rgba(232, 234, 237, 0.42);
     }
 
     * { box-sizing: border-box; }
@@ -166,6 +172,9 @@
     .banner.show { display: block; }
     .banner.dismissable { cursor: pointer; }
 
+    /* A table wider than the screen scrolls inside this box, not the page. */
+    .table-scroll { overflow-x: auto; }
+
     table {
       width: 100%;
       border-collapse: collapse;
@@ -250,26 +259,31 @@
       font-size: 12px;
     }
 
-    /* The Stop column hugs its button; the links keep the rest. */
-    th.stop-col, td.stop-col {
+    /* The actions column hugs its buttons; the links keep the rest. */
+    th.actions-col, td.actions-col {
       width: 1%;
       padding-left: 6px;
-      text-align: right;
       white-space: nowrap;
     }
 
-    button.stop {
+    .row-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+
+    button.start, button.stop {
       display: inline-flex;
       align-items: center;
       justify-content: center;
       gap: 8px;
-      /* Wide enough for "Stopping...", so the label never resizes it. */
+      /* Wide enough for "Starting..." and "Stopping...", so the label never
+         resizes it. */
       min-width: 128px;
       height: 36px;
       padding: 0 16px;
       border: 1px solid transparent;
       border-radius: 999px;
-      background: var(--stop);
       color: #fff;
       font: inherit;
       font-weight: 650;
@@ -277,14 +291,19 @@
       cursor: pointer;
     }
 
-    button.stop .glyph {
+    button.start .glyph, button.stop .glyph {
       width: 10px;
       height: 10px;
-      border-radius: 2px;
       flex: 0 0 auto;
       background: currentColor;
     }
 
+    button.start .glyph { clip-path: polygon(10% 0, 100% 50%, 10% 100%); }
+    button.stop .glyph { border-radius: 2px; }
+
+    button.start { background: var(--start); }
+    button.start:hover:not(:disabled) { background: var(--start-hover); }
+    button.stop { background: var(--stop); }
     button.stop:hover:not(:disabled) { background: var(--stop-hover); }
 
     button.stop.armed,
@@ -293,27 +312,27 @@
       color: #1b1f24;
     }
 
-    button.stop:disabled {
-      border-color: var(--line);
+    button.start:disabled, button.stop:disabled {
+      border-color: var(--disabled-line);
       background: transparent;
-      color: var(--muted);
+      color: var(--disabled-text);
       cursor: default;
     }
 
-    button.stop.idle:disabled { opacity: 0.6; }
-
+    button.start.starting { border-color: var(--start-hover); color: var(--text); }
+    button.start.starting .glyph { background: var(--start-hover); }
     button.stop.stopping { border-color: var(--stop); color: var(--text); }
-    button.stop.stopping .glyph {
-      background: var(--stop);
-      animation: stop-pulse 1s ease-in-out infinite;
+    button.stop.stopping .glyph { background: var(--stop); }
+    button.start.starting .glyph, button.stop.stopping .glyph {
+      animation: busy-pulse 1s ease-in-out infinite;
     }
 
-    @keyframes stop-pulse {
+    @keyframes busy-pulse {
       50% { opacity: 0.25; }
     }
 
     @media (prefers-reduced-motion: reduce) {
-      button.stop.stopping .glyph { animation: none; }
+      button.start.starting .glyph, button.stop.stopping .glyph { animation: none; }
     }
 
     .service:focus-visible, button:focus-visible, input:focus-visible {
@@ -330,6 +349,18 @@
     footer code {
       color: var(--text);
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    /* Phones: a 16px gutter, and nothing wider than the screen but the
+       tables (which scroll in their boxes) and the tabs (which scroll too). */
+    @media (max-width: 640px) {
+      header { padding: 16px 16px 0; }
+      main { padding: 16px 16px 32px; }
+      .title-row { flex-wrap: wrap; align-items: center; }
+      .actions { padding-bottom: 0; }
+      nav.tabs { overflow-x: auto; }
+      nav.tabs button { flex: 0 0 auto; white-space: nowrap; }
     }
   </style>
 </head>
@@ -371,14 +402,21 @@
     let lastView = "";
     let multiMachine = false;
     // The banner shows one message: a WhatsUp problem, else the config
-    // error, else the last failed stop or open (which stays until the next
-    // one, or a click).
+    // error, else the last failed start, stop or open (which stays until the
+    // next one, or a click).
     const notices = { system: "", config: "", action: "" };
-    // Stop buttons outlive the tables, which are rebuilt whenever the status
-    // changes: "machine/group/index" -> "armed" | "stopping".
-    const stopState = new Map();
+    // Start and Stop buttons outlive the tables, which are rebuilt whenever
+    // the status changes. Keyed "machine/group/index": a Stop waiting for its
+    // confirming click, or a request in flight.
+    const rowState = new Map(); // -> "armed" | "stopping" | "starting-request"
     const armTimers = new Map();
     const ARMED_MS = 4000;
+    // After a start reply, the ports it started, until they are all up or
+    // STARTING_MS passes. This alone keeps Start at "Starting...", so it can
+    // sit beside an armed Stop.
+    const startWatch = new Map(); // -> { ports: { port, action }[], timer }
+    const STARTING_MS = 3 * 60 * 1000;
+    let lastData = null;
     upOnlyEl.checked = localStorage.getItem("whatsup-up-only") === "1";
 
     // Tabs filter sections: "all", "machine:<name>" or "group:<id>". Older
@@ -499,6 +537,10 @@
       paintSummary(data);
       notice("system", "");
       notice("config", data.config_error || "");
+      // Before the early return: a row can come up without the view changing
+      // shape for long, and a watch must end the moment it does.
+      lastData = data;
+      checkStartWatches(data);
       const nextView = viewKey(data);
       if (nextView === lastView) return;
       lastView = nextView;
@@ -548,7 +590,10 @@
             heading.appendChild(note);
           }
         }
-        panel.append(heading, buildTable(group, machine));
+        const scroller = document.createElement("div");
+        scroller.className = "table-scroll";
+        scroller.appendChild(buildTable(group, machine));
+        panel.append(heading, scroller);
         tablesEl.appendChild(panel);
       });
       applyGroupVisibility();
@@ -572,11 +617,11 @@
         th.textContent = column;
         headRow.appendChild(th);
       });
-      const stopHead = document.createElement("th");
-      stopHead.scope = "col";
-      stopHead.className = "stop-col";
-      stopHead.setAttribute("aria-label", "Stop");
-      headRow.appendChild(stopHead);
+      const actionsHead = document.createElement("th");
+      actionsHead.scope = "col";
+      actionsHead.className = "actions-col";
+      actionsHead.setAttribute("aria-label", "Start and stop");
+      headRow.appendChild(actionsHead);
       head.appendChild(headRow);
       table.appendChild(head);
 
@@ -589,7 +634,7 @@
           tr.className = row.tone === "black" ? "black" : "gray";
           tr.classList.toggle("all-up", allUp);
           row.cells.forEach((cell) => tr.appendChild(renderCell(cell, machine)));
-          tr.appendChild(renderStopCell(group, row, machine));
+          tr.appendChild(renderActionsCell(group, row, machine));
           applyUpOnly(tr);
           body.appendChild(tr);
         });
@@ -655,72 +700,195 @@
       return td;
     }
 
-    function renderStopCell(group, row, machine) {
-      const td = document.createElement("td");
-      td.className = "stop-col";
-      const ports = row.ports || [];
-      if (!ports.length) return td;
+    function rowKey(machineName, groupId, index) {
+      return machineName + "/" + groupId + "/" + index;
+    }
 
+    function findRow(data, key) {
+      const machines = machinesOf(data);
+      for (const group of data.groups) {
+        const machine = machines.find((known) => known.name === group.machine) || machines[0];
+        const row = group.rows.find((candidate) => rowKey(machine.name, group.id, candidate.index) === key);
+        if (row) return { group, row };
+      }
+      return null;
+    }
+
+    function linksOf(row) {
+      return row.cells.filter((cell) => cell && cell.type === "link");
+    }
+
+    // The same rule as the server's "already up": any link on the port.
+    function portUp(row, port) {
+      return linksOf(row).some((cell) => cell.port === port && cell.up);
+    }
+
+    function rowName(group, row) {
+      const text = row.cells.find((cell) => cell && cell.type === "text");
+      return row.id || (text && text.text) || group.id + "/" + row.index;
+    }
+
+    function actionButton(kind, key, blocked) {
       const button = document.createElement("button");
       button.type = "button";
-      button.dataset.key = machine.name + "/" + group.id + "/" + row.index;
+      button.className = kind;
+      button.dataset.key = key;
+      button.dataset.blocked = blocked;
       const glyph = document.createElement("span");
       glyph.className = "glyph";
       glyph.setAttribute("aria-hidden", "true");
       const label = document.createElement("span");
       label.className = "label";
       button.append(glyph, label);
+      return button;
+    }
 
-      // Why the row cannot be stopped right now, if so.
-      const anyUp = row.cells.some((cell) => cell && cell.type === "link" && cell.up);
-      if (machine.offline) button.dataset.blocked = machine.note || machine.name + " is offline";
-      else if (machine.can_stop === false) button.dataset.blocked = "Start WhatsUp on " + machine.name + " to stop its stacks";
-      else if (!anyUp) button.dataset.blocked = "Nothing is running";
+    function renderActionsCell(group, row, machine) {
+      const td = document.createElement("td");
+      td.className = "actions-col";
+      const ports = row.ports || [];
+      if (!ports.length) return td;
 
-      button.addEventListener("click", () => stopClicked(button, {
-        machine: machine.name,
-        group: group.id,
-        row: row.index,
-        ports,
-      }));
-      paintStop(button);
-      td.appendChild(button);
+      const key = rowKey(machine.name, group.id, row.index);
+      const request = { machine: machine.name, group: group.id, row: row.index, ports };
+      // Why each button cannot act right now, if so.
+      const links = linksOf(row);
+      const offline = machine.offline ? machine.note || machine.name + " is offline" : "";
+      const cannot = machine.can_act === false ? "Start WhatsUp on " + machine.name + " to " : "";
+      const start = actionButton("start", key,
+        offline ||
+        (cannot && cannot + "start its stacks") ||
+        (links.some((cell) => !cell.up) ? "" : "Everything is running"));
+      const stop = actionButton("stop", key,
+        offline ||
+        (cannot && cannot + "stop its stacks") ||
+        (links.some((cell) => cell.up) ? "" : "Nothing is running"));
+      start.addEventListener("click", () => startClicked(key, request));
+      stop.addEventListener("click", () => stopClicked(key, request));
+
+      const wrap = document.createElement("div");
+      wrap.className = "row-actions";
+      wrap.append(start, stop);
+      td.appendChild(wrap);
+      paintActions(key, td);
       return td;
     }
 
-    function paintStop(button) {
-      const blocked = button.dataset.blocked || "";
-      let state = stopState.get(button.dataset.key) || "idle";
-      // Nothing left to confirm once the row cannot be stopped.
-      if (state === "armed" && blocked) state = "idle";
-      button.className = "stop " + state;
-      button.disabled = state === "stopping" || (state === "idle" && Boolean(blocked));
-      button.querySelector(".label").textContent =
-        state === "armed" ? "Confirm" : state === "stopping" ? "Stopping..." : "Stop";
-      button.title =
-        state === "stopping" ? "" :
-        state === "armed" ? "Click again to stop everything on this row's ports" :
-        blocked || "Stop everything on this row's ports";
-    }
+    // Paints the row's buttons: those under `root` (a cell not yet in the
+    // page), else every copy in the page.
+    function paintActions(key, root = document) {
+      const state = rowState.get(key) || "";
+      const busy = state === "stopping" || state === "starting-request";
+      root.querySelectorAll(".row-actions").forEach((wrap) => {
+        const start = wrap.querySelector("button.start");
+        const stop = wrap.querySelector("button.stop");
+        if (start.dataset.key !== key) return;
 
-    function setStopState(key, state) {
-      clearTimeout(armTimers.get(key));
-      armTimers.delete(key);
-      if (state) stopState.set(key, state);
-      else stopState.delete(key);
-      document.querySelectorAll("button.stop").forEach((button) => {
-        if (button.dataset.key === key) paintStop(button);
+        const stopBlocked = stop.dataset.blocked || "";
+        // Nothing left to confirm once the row cannot be stopped.
+        const stopShows = state === "stopping" ? "stopping" : state === "armed" && !stopBlocked ? "armed" : "idle";
+        stop.className = "stop " + stopShows;
+        stop.disabled = busy || (stopShows === "idle" && Boolean(stopBlocked));
+        stop.querySelector(".label").textContent =
+          stopShows === "armed" ? "Confirm" : stopShows === "stopping" ? "Stopping..." : "Stop";
+        stop.title =
+          busy ? "" :
+          stopShows === "armed" ? "Click again to stop everything on this row's ports" :
+          stopBlocked || "Stop everything on this row's ports";
+
+        // An armed Stop waits for its confirming click; Start waits for it.
+        const armed = stopShows === "armed";
+        const startBlocked = start.dataset.blocked || "";
+        const starting = state === "starting-request" || startWatch.has(key);
+        start.className = "start " + (starting ? "starting" : "idle");
+        start.disabled = starting || busy || armed || Boolean(startBlocked);
+        start.querySelector(".label").textContent = starting ? "Starting..." : "Start";
+        start.title =
+          starting || busy ? "" :
+          armed ? "Confirm or wait for Stop first" :
+          startBlocked || "Start whatever of this row is not running";
       });
     }
 
-    async function stopClicked(button, request) {
-      const key = button.dataset.key;
-      if (stopState.get(key) !== "armed") {
-        setStopState(key, "armed");
-        armTimers.set(key, setTimeout(() => setStopState(key, null), ARMED_MS));
+    function setRowState(key, state) {
+      clearTimeout(armTimers.get(key));
+      armTimers.delete(key);
+      if (state) rowState.set(key, state);
+      else rowState.delete(key);
+      paintActions(key);
+    }
+
+    function endWatch(key) {
+      const watch = startWatch.get(key);
+      if (!watch) return;
+      clearTimeout(watch.timer);
+      startWatch.delete(key);
+      paintActions(key);
+    }
+
+    // Ends each watch whose ports are all up, or whose row is gone.
+    function checkStartWatches(data) {
+      if (!data) return;
+      startWatch.forEach((watch, key) => {
+        const found = findRow(data, key);
+        if (!found || watch.ports.every(({ port }) => portUp(found.row, port))) endWatch(key);
+      });
+    }
+
+    function startTimedOut(key) {
+      const watch = startWatch.get(key);
+      endWatch(key);
+      const found = lastData && findRow(lastData, key);
+      if (!watch || !found) return;
+      const down = watch.ports.filter(({ port }) => !portUp(found.row, port));
+      if (!down.length) return;
+      const waiting = down.map(({ port }) => {
+        const link = linksOf(found.row).find((cell) => cell.port === port);
+        return (link ? link.label : "port") + " (" + port + ")";
+      });
+      // Point at where a stuck start shows why: its herdr tab, or docker.
+      const hints = [];
+      if (down.some(({ action }) => action === "herdr")) hints.push("see its herdr tab");
+      if (down.some(({ action }) => action !== "herdr")) hints.push("check docker");
+      notice("action", rowName(found.group, found.row) + ": still waiting for " + waiting.join(", ") + "...; " + hints.join(" and "));
+    }
+
+    async function startClicked(key, request) {
+      setRowState(key, "starting-request");
+      notice("action", "");
+      let started = [];
+      try {
+        const response = await fetch("/api/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request),
+        });
+        const payload = (await response.json().catch(() => null)) || {};
+        if (!response.ok) notice("action", "Start failed: " + (payload.error || "status " + response.status));
+        // A failed reply may still have started some ports: watch those too.
+        started = (payload.results || [])
+          .filter((result) => result.action !== "none" && !result.error)
+          .map((result) => ({ port: result.port, action: result.action }));
+      } catch (err) {
+        notice("action", "Start failed: could not reach WhatsUp");
+      }
+      if (started.length) {
+        clearTimeout((startWatch.get(key) || {}).timer);
+        startWatch.set(key, { ports: started, timer: setTimeout(() => startTimedOut(key), STARTING_MS) });
+      }
+      setRowState(key, null);
+      checkStartWatches(lastData);
+    }
+
+    async function stopClicked(key, request) {
+      if (rowState.get(key) !== "armed") {
+        setRowState(key, "armed");
+        armTimers.set(key, setTimeout(() => setRowState(key, null), ARMED_MS));
         return;
       }
-      setStopState(key, "stopping");
+      // Stopping ends a start still on its way up.
+      endWatch(key);
+      setRowState(key, "stopping");
       notice("action", "");
       try {
         const response = await fetch("/api/stop", {
@@ -728,12 +896,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(request),
         });
-        const payload = await response.json().catch(() => ({}));
+        const payload = (await response.json().catch(() => null)) || {};
         if (!response.ok) notice("action", "Stop failed: " + (payload.error || "status " + response.status));
       } catch (err) {
         notice("action", "Stop failed: could not reach WhatsUp");
       } finally {
-        setStopState(key, null);
+        setRowState(key, null);
       }
     }
 
@@ -745,7 +913,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ url, machine }),
         });
-        const payload = await response.json();
+        const payload = (await response.json().catch(() => null)) || {};
         notice("action", response.ok ? "" : payload.error || "Could not open the browser");
       } catch (err) {
         notice("action", "Could not reach WhatsUp");

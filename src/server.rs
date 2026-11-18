@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::ToSocketAddrs;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -17,8 +18,9 @@ use crate::config::{
     config_mtime, load_config, Cell, DashboardConfig, Group, Link, Remote, Row, Tone,
 };
 use crate::herdr::{list_workspaces, matching_labels, HerdrWorkspace, QUERY_BUDGET};
-use crate::probe::probe_ports;
+use crate::probe::{port_is_open, probe_ports, CONNECT_TIMEOUT};
 use crate::socks::{post_json, probe_remote, PostError, Reach};
+use crate::start::{PortStart, StartKind, Starter};
 use crate::stop::{Action, PortResult, Stopper};
 use crate::tunnel::{TunnelState, Tunnels};
 use crate::DASHBOARD_HTML;
@@ -54,16 +56,24 @@ struct Inner {
     /// This machine's herdr socket, if herdr labels can be read here.
     local_herdr: Option<std::path::PathBuf>,
     stopper: Arc<dyn Stopper>,
-    /// Rows being stopped right now, as (group id, row index).
-    stopping: Arc<Mutex<BTreeSet<(String, usize)>>>,
-    /// How long a stop forwarded to a remote WhatsUp may take.
-    forward_timeout: Duration,
+    starter: Arc<dyn Starter>,
+    /// Whether a link to (host, port) is up, which a start skips.
+    probe: Probe,
+    /// Rows being started or stopped right now, as (group id, row index),
+    /// with what is happening to them ("starting" or "stopping").
+    busy: Arc<Mutex<BTreeMap<(String, usize), &'static str>>>,
+    /// How long a stop or start forwarded to a remote WhatsUp may take.
+    stop_forward_timeout: Duration,
+    start_forward_timeout: Duration,
 }
+
+type Probe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
 
 /// What the dashboard does to the machine it runs on.
 pub struct Actions {
     pub opener: Arc<dyn BrowserOpener>,
     pub stopper: Arc<dyn Stopper>,
+    pub starter: Arc<dyn Starter>,
 }
 
 #[derive(Clone)]
@@ -95,18 +105,32 @@ impl AppState {
                 tunnels,
                 local_herdr,
                 stopper: actions.stopper,
-                stopping: Arc::default(),
-                forward_timeout: FORWARD_TIMEOUT,
+                starter: actions.starter,
+                probe: Arc::new(is_up),
+                busy: Arc::default(),
+                stop_forward_timeout: STOP_FORWARD_TIMEOUT,
+                start_forward_timeout: START_FORWARD_TIMEOUT,
             }),
         }
     }
 
-    /// Replaces how long a forwarded stop may take (for tests). Only before
-    /// the state is shared.
+    fn unshared(&mut self) -> &mut Inner {
+        Arc::get_mut(&mut self.inner).expect("the state is not shared yet")
+    }
+
+    /// Replaces how long a forwarded stop or start may take (for tests).
+    /// Only before the state is shared.
     pub fn with_forward_timeout(mut self, timeout: Duration) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("the state is not shared yet")
-            .forward_timeout = timeout;
+        let inner = self.unshared();
+        inner.stop_forward_timeout = timeout;
+        inner.start_forward_timeout = timeout;
+        self
+    }
+
+    /// Replaces how a start decides a link is already up (for tests). Only
+    /// before the state is shared.
+    pub fn with_probe(mut self, probe: Probe) -> Self {
+        self.unshared().probe = probe;
         self
     }
 
@@ -146,6 +170,7 @@ pub fn router(state: AppState) -> Router {
         .route("/", get(index))
         .route("/api/dashboard", get(dashboard))
         .route("/api/open", post(open_link))
+        .route("/api/start", post(start_row))
         .route("/api/stop", post(stop_row))
         .route("/api/quit", post(quit))
         .with_state(state)
@@ -170,7 +195,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         .iter()
         .map(|remote| {
             // The remote's own WhatsUp is probed with its links: it is what
-            // stops that machine's rows.
+            // starts and stops that machine's rows.
             let socks_port = remote.socks_port;
             let targets: Vec<(String, u16)> = remote_links(&config, &remote.name)
                 .into_iter()
@@ -199,7 +224,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         note: None,
         up: Box::new(move |link: &Link| local_status.get(&link.port).copied().unwrap_or(false)),
         counts: (0, 0),
-        can_stop: true,
+        can_act: true,
         herdr: herdr_result(local_herdr).await,
     }];
     machines[0].counts = count_local(&config, &machines[0]);
@@ -221,7 +246,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         let links = remote_links(&config, &remote.name);
         let up = |target: &(String, u16)| !offline && reach.get(target) == Some(&Reach::Up);
         let counts = (links.iter().filter(|link| up(link)).count(), links.len());
-        let can_stop = up(&remote_whatsup(remote));
+        let can_act = up(&remote_whatsup(remote));
         machines.push(MachineStatus {
             name: remote.name.clone(),
             local: false,
@@ -231,7 +256,7 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
                 !offline && reach.get(&(link.host.clone(), link.port)) == Some(&Reach::Up)
             }),
             counts,
-            can_stop,
+            can_act,
             herdr: herdr_result(herdr).await,
         });
     }
@@ -260,8 +285,8 @@ struct MachineStatus {
     note: Option<String>,
     up: Box<dyn Fn(&Link) -> bool + Send>,
     counts: (usize, usize),
-    /// Whether this dashboard can stop the machine's rows.
-    can_stop: bool,
+    /// Whether this dashboard can start and stop the machine's rows.
+    can_act: bool,
     /// The machine's herdr workspaces, when they could be read.
     herdr: Option<Vec<HerdrWorkspace>>,
 }
@@ -315,8 +340,10 @@ async fn open_link(State(state): State<AppState>, Json(request): Json<OpenReques
     }
 }
 
+/// A start or stop of one row, as the dashboard page (or a WhatsUp
+/// forwarding it) sends it.
 #[derive(Deserialize)]
-struct StopRequest {
+struct RowRequest {
     #[serde(default)]
     machine: Option<String>,
     group: String,
@@ -324,19 +351,57 @@ struct StopRequest {
     ports: Vec<u16>,
 }
 
-const CONFIG_CHANGED: &str = "the dashboard config changed; reload and try again";
+/// What a row request does. Start and Stop share every check, the busy mark
+/// and the forwarding; they differ in the work and the words.
+#[derive(Clone, Copy)]
+enum Act {
+    Start,
+    Stop,
+}
+
+impl Act {
+    fn verb(self) -> &'static str {
+        match self {
+            Act::Start => "start",
+            Act::Stop => "stop",
+        }
+    }
+
+    /// What a row is doing while this runs, as "already ..." says it.
+    fn doing(self) -> &'static str {
+        match self {
+            Act::Start => "starting",
+            Act::Stop => "stopping",
+        }
+    }
+
+    fn path(self) -> &'static str {
+        match self {
+            Act::Start => "/api/start",
+            Act::Stop => "/api/stop",
+        }
+    }
+}
+
+pub(crate) const CONFIG_CHANGED: &str = "the dashboard config changed; reload and try again";
 
 /// How long a forwarded stop may take: the remote's own worst case (the
 /// docker listing, a docker stop, a kill) and some room.
-const FORWARD_TIMEOUT: Duration = Duration::from_secs(90);
+const STOP_FORWARD_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// How long a forwarded start may take: the remote's own worst case (about
+/// 130 s: the docker listing and a compose start beside two herdr links)
+/// and some room.
+const START_FORWARD_TIMEOUT: Duration = Duration::from_secs(180);
 
 fn error_response(status: StatusCode, error: impl Into<String>) -> Response {
     (status, Json(json!({ "error": error.into() }))).into_response()
 }
 
-/// Stops are for this dashboard's own page (or a WhatsUp forwarding one),
-/// not for any site the browser happens to have open: the request must be
-/// addressed to loopback by name, and come from this origin if it names one.
+/// Starts and stops are for this dashboard's own page (or a WhatsUp
+/// forwarding one), not for any site the browser happens to have open: the
+/// request must be addressed to loopback by name, and come from this origin
+/// if it names one.
 fn from_this_dashboard(headers: &HeaderMap) -> bool {
     let text = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let Some(host) = text("host") else {
@@ -352,8 +417,8 @@ fn from_this_dashboard(headers: &HeaderMap) -> bool {
     loopback && text("origin").is_none_or(|origin| origin == format!("http://{host}"))
 }
 
-/// Why a stop must not act for a link to `host`, if so: only a name that
-/// resolves, and only to loopback, is this machine.
+/// Why a start or stop must not act for a link to `host`, if so: only a
+/// name that resolves, and only to loopback, is this machine.
 fn not_this_machine(host: &str) -> Option<String> {
     let addresses: Vec<_> = match (host, 0).to_socket_addrs() {
         Ok(addresses) => addresses.collect(),
@@ -382,13 +447,132 @@ fn foreign_hosts(row: &Row) -> BTreeMap<u16, String> {
     foreign
 }
 
-/// Releases a row's "being stopped" mark when the stop ends, however it ends.
-struct Stopping {
-    rows: Arc<Mutex<BTreeSet<(String, usize)>>>,
+/// A port left alone because of `reason`.
+fn refused(port: u16, reason: &str) -> PortResult {
+    PortResult {
+        port,
+        action: Action::None,
+        detail: String::new(),
+        error: Some(reason.to_string()),
+    }
+}
+
+/// Whether a link to `host` on `port` is up, agreeing with the dashboard's
+/// green: localhost answers on `port` (IPv4 or IPv6), or the link's host
+/// does.
+fn is_up(host: &str, port: u16) -> bool {
+    port_is_open(port) || link_is_up(host, port)
+}
+
+/// Whether any address `host` resolves to accepts a TCP connection on `port`.
+fn link_is_up(host: &str, port: u16) -> bool {
+    (host, port).to_socket_addrs().is_ok_and(|mut addresses| {
+        addresses.any(|address| TcpStream::connect_timeout(&address, CONNECT_TIMEOUT).is_ok())
+    })
+}
+
+/// What starting `row` takes on this machine: an entry for each port to
+/// start, in port order, and the results already decided: a link to
+/// another machine (not probed), or a port that is `up` already.
+fn plan_start(row: &Row, up: impl Fn(&str, u16) -> bool) -> (Vec<PortStart>, Vec<PortResult>) {
+    let foreign = foreign_hosts(row);
+    let links: Vec<&Link> = row
+        .cells
+        .iter()
+        .filter_map(|cell| match cell {
+            Cell::Link(link) => Some(link),
+            _ => None,
+        })
+        .collect();
+    let (mut plan, mut decided) = (Vec::new(), Vec::new());
+    for port in row.ports() {
+        if let Some(reason) = foreign.get(&port) {
+            decided.push(refused(port, reason));
+            continue;
+        }
+        let on_port: Vec<&Link> = links
+            .iter()
+            .copied()
+            .filter(|link| link.port == port)
+            .collect();
+        let hosts: BTreeSet<&str> = on_port.iter().map(|link| link.host.as_str()).collect();
+        if hosts.into_iter().any(|host| up(host, port)) {
+            decided.push(PortResult {
+                port,
+                action: Action::None,
+                detail: "already up".into(),
+                error: None,
+            });
+            continue;
+        }
+        // The config allows one start command per port, and only in a row
+        // with a herdr cell to name the workspace.
+        let command = on_port
+            .iter()
+            .find_map(|link| Some((link, link.start.as_ref()?)));
+        let kind = match (command, row.herdr_prefix()) {
+            (Some((link, start)), Some(prefix)) => StartKind::Herdr {
+                prefix: prefix.to_string(),
+                label: link.label.clone(),
+                dir: PathBuf::from(&start.dir),
+                run: start.run.clone(),
+            },
+            _ => StartKind::Docker,
+        };
+        plan.push(PortStart { port, kind });
+    }
+    (plan, decided)
+}
+
+/// Starts what serves `row`'s ports that are down; one result per port, in
+/// port order.
+fn start_ports(
+    starter: &dyn Starter,
+    row: &Row,
+    up: &dyn Fn(&str, u16) -> bool,
+) -> Vec<PortResult> {
+    let (plan, decided) = plan_start(row, up);
+    let started = if plan.is_empty() {
+        Vec::new()
+    } else {
+        starter.start(&plan)
+    };
+    let mut results: Vec<PortResult> = decided.into_iter().chain(started).collect();
+    results.sort_by_key(|result| result.port);
+    results
+}
+
+/// Stops what serves `row`'s ports; one result per port, in port order.
+fn stop_ports(stopper: &dyn Stopper, row: &Row) -> Vec<PortResult> {
+    let ports = row.ports();
+    let foreign = foreign_hosts(row);
+    let ours: Vec<u16> = ports
+        .iter()
+        .copied()
+        .filter(|port| !foreign.contains_key(port))
+        .collect();
+    let mut stopped = if ours.is_empty() {
+        Vec::new()
+    } else {
+        stopper.stop(&ours)
+    }
+    .into_iter();
+    ports
+        .iter()
+        .map(|port| match foreign.get(port) {
+            Some(reason) => refused(*port, reason),
+            None => stopped.next().expect("one result per port"),
+        })
+        .collect()
+}
+
+/// Releases a row's busy mark when its start or stop ends, however it ends.
+struct Busy {
+    rows: Arc<Mutex<BTreeMap<(String, usize), &'static str>>>,
     key: (String, usize),
 }
 
-impl Drop for Stopping {
+impl Drop for Busy {
     fn drop(&mut self) {
         if let Ok(mut rows) = self.rows.lock() {
             rows.remove(&self.key);
@@ -396,7 +580,7 @@ impl Drop for Stopping {
     }
 }
 
-fn stop_response(results: &[PortResult]) -> Response {
+fn action_response(results: &[PortResult]) -> Response {
     let failures: Vec<String> = results
         .iter()
         .filter_map(|result| {
@@ -425,15 +609,27 @@ fn stop_response(results: &[PortResult]) -> Response {
     }
 }
 
+async fn start_row(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    act_on_row(state, headers, body, Act::Start).await
+}
+
 async fn stop_row(State(state): State<AppState>, headers: HeaderMap, body: String) -> Response {
+    act_on_row(state, headers, body, Act::Stop).await
+}
+
+async fn act_on_row(state: AppState, headers: HeaderMap, body: String, act: Act) -> Response {
+    let verb = act.verb();
     if !from_this_dashboard(&headers) {
-        return error_response(StatusCode::FORBIDDEN, "stops must come from this dashboard");
+        return error_response(
+            StatusCode::FORBIDDEN,
+            format!("{verb}s must come from this dashboard"),
+        );
     }
     let bad = |error: String| error_response(StatusCode::BAD_REQUEST, error);
     // Parsed here, not by an extractor, so every reply is JSON.
-    let request: StopRequest = match serde_json::from_str(&body) {
+    let request: RowRequest = match serde_json::from_str(&body) {
         Ok(request) => request,
-        Err(err) => return bad(format!("not a stop request: {err}")),
+        Err(err) => return bad(format!("not a {verb} request: {err}")),
     };
     let (config, _) = state.reload();
     let local = state.local_label(&config);
@@ -459,7 +655,7 @@ async fn stop_row(State(state): State<AppState>, headers: HeaderMap, body: Strin
     };
     let ports = row.ports();
     if ports.is_empty() {
-        return bad("that row has nothing to stop".into());
+        return bad(format!("that row has nothing to {verb}"));
     }
     let seen: BTreeSet<u16> = request.ports.iter().copied().collect();
     if !row.shown_on(&machine) || !seen.into_iter().eq(ports.iter().copied()) {
@@ -474,100 +670,93 @@ async fn stop_row(State(state): State<AppState>, headers: HeaderMap, body: Strin
             "ports": ports,
         })
         .to_string();
-        let (socks_port, whatsup_port) = (remote.socks_port, remote.whatsup_port);
-        let timeout = state.inner.forward_timeout;
-        let reply = tokio::task::spawn_blocking(move || {
-            post_json(socks_port, whatsup_port, "/api/stop", &body, timeout)
-        })
-        .await
-        .expect("forwarded stop");
-        let name = &remote.name;
-        return match reply {
-            Ok((status, body)) => match (
-                StatusCode::from_u16(status),
-                serde_json::from_str::<Value>(&body),
-            ) {
-                (Ok(status), Ok(mut body))
-                    if status != StatusCode::NOT_FOUND && body.is_object() =>
-                {
-                    // Say whose error it is. This dashboard already checked
-                    // the row, so a "config changed" from the remote means
-                    // the two machines read different configs.
-                    if let Some(error) = body.get("error").and_then(Value::as_str) {
-                        body["error"] = Value::String(if error == CONFIG_CHANGED {
-                            format!(
-                                "{name}'s WhatsUp has a different config for that row; update the config on both machines"
-                            )
-                        } else {
-                            format!("{name}: {error}")
-                        });
-                    }
-                    (status, Json(body)).into_response()
-                }
-                _ => error_response(
-                    StatusCode::BAD_GATEWAY,
-                    format!("WhatsUp on {name} cannot stop stacks; update it"),
-                ),
-            },
-            Err(PostError::Connect) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("WhatsUp is not running on {name}"),
-            ),
-            Err(PostError::Reply(_)) => error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("{name} did not answer in time; it may still be stopping"),
-            ),
+        let timeout = match act {
+            Act::Start => state.inner.start_forward_timeout,
+            Act::Stop => state.inner.stop_forward_timeout,
         };
+        return forward(act, remote, body, timeout).await;
     }
 
     let key = (group.id.clone(), request.row);
-    if !state
-        .inner
-        .stopping
-        .lock()
-        .expect("stopping lock")
-        .insert(key.clone())
-    {
-        return error_response(StatusCode::CONFLICT, "already stopping");
-    }
-    let mark = Stopping {
-        rows: state.inner.stopping.clone(),
-        key,
+    let mark = {
+        let mut busy = state.inner.busy.lock().expect("busy lock");
+        if let Some(doing) = busy.get(&key) {
+            return error_response(StatusCode::CONFLICT, format!("already {doing}"));
+        }
+        busy.insert(key.clone(), act.doing());
+        Busy {
+            rows: state.inner.busy.clone(),
+            key,
+        }
     };
-    let stopper = state.inner.stopper.clone();
+    let inner = state.inner.clone();
     let row = row.clone();
     // A blocking task runs to its end even when the client goes away, and
     // the mark is released there, not here.
     let results = tokio::task::spawn_blocking(move || {
         let _mark = mark;
-        let foreign = foreign_hosts(&row);
-        let ours: Vec<u16> = ports
-            .iter()
-            .copied()
-            .filter(|port| !foreign.contains_key(port))
-            .collect();
-        let mut stopped = if ours.is_empty() {
-            Vec::new()
-        } else {
-            stopper.stop(&ours)
+        match act {
+            Act::Start => start_ports(&*inner.starter, &row, &*inner.probe),
+            Act::Stop => stop_ports(&*inner.stopper, &row),
         }
-        .into_iter();
-        ports
-            .iter()
-            .map(|port| match foreign.get(port) {
-                Some(reason) => PortResult {
-                    port: *port,
-                    action: Action::None,
-                    detail: String::new(),
-                    error: Some(reason.clone()),
-                },
-                None => stopped.next().expect("one result per port"),
-            })
-            .collect::<Vec<_>>()
     })
     .await
-    .expect("stop task");
-    stop_response(&results)
+    .expect("row task");
+    action_response(&results)
+}
+
+/// Sends a start or stop of one of `remote`'s rows to that machine's own
+/// WhatsUp, and says whose error it is when it fails.
+async fn forward(act: Act, remote: &Remote, body: String, timeout: Duration) -> Response {
+    let (socks_port, whatsup_port) = (remote.socks_port, remote.whatsup_port);
+    let path = act.path();
+    let reply = tokio::task::spawn_blocking(move || {
+        post_json(socks_port, whatsup_port, path, &body, timeout)
+    })
+    .await
+    .expect("forwarded request");
+    let name = &remote.name;
+    match reply {
+        Ok((status, body)) => match (
+            StatusCode::from_u16(status),
+            serde_json::from_str::<Value>(&body),
+        ) {
+            (Ok(status), Ok(mut body)) if status != StatusCode::NOT_FOUND && body.is_object() => {
+                // Say whose error it is. This dashboard already checked the
+                // row, so a "config changed" from the remote means the two
+                // machines read different configs.
+                if let Some(error) = body.get("error").and_then(Value::as_str) {
+                    body["error"] = Value::String(if error == CONFIG_CHANGED {
+                        format!(
+                            "{name}'s WhatsUp has a different config for that row; update the config on both machines"
+                        )
+                    } else {
+                        format!("{name}: {error}")
+                    });
+                }
+                (status, Json(body)).into_response()
+            }
+            _ => error_response(
+                StatusCode::BAD_GATEWAY,
+                format!("WhatsUp on {name} cannot {} stacks; update it", act.verb()),
+            ),
+        },
+        Err(PostError::Connect) => error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("WhatsUp is not running on {name}"),
+        ),
+        Err(PostError::Timeout) => error_response(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "{name} did not answer in time; it may still be {}",
+                act.doing()
+            ),
+        ),
+        Err(PostError::Reply(reason)) => error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("{name} did not reply to the {}: {reason}", act.verb()),
+        ),
+    }
 }
 
 async fn quit(State(state): State<AppState>) -> Json<Value> {
@@ -603,7 +792,7 @@ fn view(
             "note": machine.note,
             "ports_up": machine.counts.0,
             "ports_total": machine.counts.1,
-            "can_stop": machine.can_stop,
+            "can_act": machine.can_act,
         })).collect::<Vec<_>>(),
         "groups": machines
             .iter()
@@ -627,9 +816,11 @@ fn group_view(group: &Group, machine: &MachineStatus) -> Value {
         "columns": group.columns,
         "rows": group.rows.iter().enumerate().filter(|(_, row)| row.shown_on(&machine.name)).map(|(index, row)| {
             json!({
-                // The row's place in the config, which /api/stop takes back
-                // together with the ports to prove it means the same row.
+                // The row's place in the config, which /api/start and /api/stop
+                // take back together with the ports to prove it means the
+                // same row.
                 "index": index,
+                "id": row.id,
                 "ports": row.ports(),
                 "tone": match row.tone {
                     Tone::Gray => "gray",
@@ -731,6 +922,67 @@ mod tests {
         }
     }
 
+    /// Records the plans it is asked to start. With a `gate`, each start
+    /// waits for one message first; with `fail`, that port reports "boom".
+    #[derive(Default)]
+    struct RecordingStarter {
+        plans: Mutex<Vec<Vec<PortStart>>>,
+        gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        fail: Option<u16>,
+    }
+
+    impl RecordingStarter {
+        fn plans(&self) -> Vec<Vec<PortStart>> {
+            self.plans.lock().unwrap().clone()
+        }
+    }
+
+    impl Starter for RecordingStarter {
+        fn start(&self, plan: &[PortStart]) -> Vec<PortResult> {
+            self.plans.lock().unwrap().push(plan.to_vec());
+            if let Some(gate) = self.gate.lock().unwrap().as_ref() {
+                let _ = gate.recv();
+            }
+            plan.iter()
+                .map(|entry| PortResult {
+                    port: entry.port,
+                    action: match entry.kind {
+                        StartKind::Docker => Action::Compose,
+                        StartKind::Herdr { .. } => Action::Herdr,
+                    },
+                    detail: "started".into(),
+                    error: (self.fail == Some(entry.port)).then(|| "boom".to_string()),
+                })
+                .collect()
+        }
+    }
+
+    /// What a test server does instead of acting on this machine. Unless
+    /// `real_probe`, every port counts as down, so the dev servers running
+    /// here cannot change a start's plan.
+    #[derive(Default)]
+    struct Fakes {
+        stopper: Arc<RecordingStopper>,
+        starter: Arc<RecordingStarter>,
+        real_probe: bool,
+    }
+
+    impl Fakes {
+        fn stopping(stopper: Arc<RecordingStopper>) -> Self {
+            Self {
+                stopper,
+                ..Default::default()
+            }
+        }
+
+        fn starting(starter: Arc<RecordingStarter>) -> Self {
+            Self {
+                starter,
+                ..Default::default()
+            }
+        }
+    }
+
     /// Serves `config_json` with a recording opener. Tunnels run a stub that
     /// stays up like a healthy ssh, so probes go to whatever SOCKS port the
     /// config names.
@@ -756,18 +1008,18 @@ mod tests {
         socket_dir: PathBuf,
         local_herdr: Option<PathBuf>,
     ) -> (SocketAddr, Arc<Recording>, PathBuf) {
-        let stopper = Arc::new(RecordingStopper::default());
-        serve_all(name, config_json, program, socket_dir, local_herdr, stopper).await
+        let fakes = Fakes::default();
+        serve_all(name, config_json, program, socket_dir, local_herdr, fakes).await
     }
 
-    /// Like `serve_herdr`, with the stopper the test wants to watch.
+    /// Like `serve_herdr`, with the fakes the test wants to watch.
     async fn serve_all(
         name: &str,
         config_json: &str,
         program: PathBuf,
         socket_dir: PathBuf,
         local_herdr: Option<PathBuf>,
-        stopper: Arc<RecordingStopper>,
+        fakes: Fakes,
     ) -> (SocketAddr, Arc<Recording>, PathBuf) {
         let dir = std::env::temp_dir().join(format!("whatsup-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -778,12 +1030,13 @@ mod tests {
         let (shutdown, _rx) = watch::channel(false);
         let opener = Arc::new(Recording(Mutex::new(Vec::new())));
         let tunnels = Arc::new(Tunnels::new(program, socket_dir));
-        let state = AppState::new(
+        let mut state = AppState::new(
             config_path,
             config,
             Actions {
                 opener: opener.clone(),
-                stopper,
+                stopper: fakes.stopper,
+                starter: fakes.starter,
             },
             shutdown,
             HOSTNAME.to_string(),
@@ -791,6 +1044,9 @@ mod tests {
             local_herdr,
         )
         .with_forward_timeout(Duration::from_millis(500));
+        if !fakes.real_probe {
+            state = state.with_probe(Arc::new(|_, _| false));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -1006,7 +1262,7 @@ mod tests {
                 "note": null,
                 "ports_up": json["ports_up"],
                 "ports_total": json["ports_total"],
-                "can_stop": true,
+                "can_act": true,
             }])
         );
         assert_eq!(json["groups"][0]["machine"], HOSTNAME);
@@ -1048,21 +1304,21 @@ mod tests {
         assert_eq!(machine["ports_up"], 1);
         assert_eq!(machine["ports_total"], 2);
         // lucy's own WhatsUp did not answer, and is not one of her ports.
-        assert_eq!(machine["can_stop"], false);
-        assert_eq!(json["machines"][0]["can_stop"], true);
+        assert_eq!(machine["can_act"], false);
+        assert_eq!(json["machines"][0]["can_act"], true);
         assert_eq!(lucy["rows"][0]["index"], 0);
         assert_eq!(lucy["rows"][0]["ports"], json!([3000, 3001]));
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn remote_can_stop_when_its_whatsup_answers() {
+    async fn remote_can_act_when_its_whatsup_answers() {
         let (socks_port, _requests) =
             crate::socks::fake::start(|_, _| crate::socks::fake::Act::Reply(0));
-        let (addr, _opener, dir) = serve("can-stop", &remote_config(socks_port)).await;
+        let (addr, _opener, dir) = serve("can-act", &remote_config(socks_port)).await;
         let json = dashboard_json(addr).await;
         let machine = &json["machines"][1];
-        assert_eq!(machine["can_stop"], true);
+        assert_eq!(machine["can_act"], true);
         assert_eq!(machine["ports_up"], 2);
         assert_eq!(machine["ports_total"], 2, "its WhatsUp is not counted");
         let _ = std::fs::remove_dir_all(dir);
@@ -1075,15 +1331,17 @@ mod tests {
             "columns": ["Name", "Portal", "Admin", "Schema"],
             "rows": [
                 { "cells": ["text only", null, null, null] },
-                { "cells": [
-                    "jds4",
-                    { "label": "portal", "url": "http://localhost:3004" },
+                { "id": "jds4", "cells": [
+                    { "text": "jds4", "herdr": "h4" },
+                    { "label": "portal", "url": "http://localhost:3004",
+                      "start": { "dir": "~/workspace/huvr4", "run": "tt4a" } },
                     { "label": "admin", "url": "http://localhost:8004/admin/" },
                     { "label": "schema", "url": "http://localhost:8004/schema/" }
                 ] },
-                { "machines": ["lucy"], "cells": [
-                    "jds7",
-                    { "label": "portal7", "url": "http://localhost:3007" },
+                { "id": "jds7", "machines": ["lucy"], "cells": [
+                    { "text": "jds7", "herdr": "h7" },
+                    { "label": "portal7", "url": "http://localhost:3007",
+                      "start": { "dir": "~/workspace/huvr7", "run": "tt7a" } },
                     null,
                     null
                 ] },
@@ -1094,26 +1352,52 @@ mod tests {
                     null
                 ] }
             ]
+        }, {
+            "id": "pc",
+            "label": "Pipeline",
+            "columns": ["Workspace", "Portal", "Calc docs", "Calc", "Admin", "Schema", "Api"],
+            "rows": [
+                { "id": "jds2", "cells": [
+                    { "text": "jds2", "herdr": "h2" },
+                    { "label": "portal", "url": "http://localhost:3002",
+                      "start": { "dir": "~/workspace/huvr2", "run": "tt2a && cd frontend && npm start" } },
+                    { "label": "calc docs", "url": "http://localhost:4002/docs/" },
+                    { "label": "tt-calc-app", "url": "http://localhost:4002",
+                      "start": { "dir": "~/workspace/tt-calc-app2", "run": "ttc2a" } },
+                    { "label": "admin", "url": "http://localhost:8002/admin/" },
+                    { "label": "schema", "url": "http://localhost:8002/schema/" },
+                    { "label": "api", "url": "http://localhost:8002/api/" }
+                ] }
+            ]
         }]
     }"#;
 
     async fn serve_stop(name: &str, stopper: Arc<RecordingStopper>) -> (SocketAddr, PathBuf) {
-        let (_, program) = crate::tunnel::testing::running_stub(&format!("stop-{name}"));
-        let (addr, _opener, dir) = serve_all(
+        serve_config(
             &format!("stop-{name}"),
             STOP_CONFIG,
-            program,
-            std::env::temp_dir(),
-            None,
-            stopper,
+            Fakes::stopping(stopper),
         )
-        .await;
-        (addr, dir)
+        .await
     }
 
     /// POSTs `body` to /api/stop with the given Host (default: the address)
     /// and Origin; returns the status and the JSON reply.
     async fn stop(addr: SocketAddr, body: &str, headers: &[(&str, &str)]) -> (u16, Value) {
+        send(addr, "/api/stop", body, headers).await
+    }
+
+    /// Like `stop`, to /api/start.
+    async fn start(addr: SocketAddr, body: &str, headers: &[(&str, &str)]) -> (u16, Value) {
+        send(addr, "/api/start", body, headers).await
+    }
+
+    async fn send(
+        addr: SocketAddr,
+        path: &'static str,
+        body: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
         let body = body.to_string();
         let host = headers
             .iter()
@@ -1129,7 +1413,7 @@ mod tests {
             let mut stream = TcpStream::connect(addr).unwrap();
             write!(
                 stream,
-                "POST /api/stop HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "POST {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             )
             .unwrap();
@@ -1366,14 +1650,10 @@ mod tests {
         )
     }
 
-    async fn serve_config(
-        name: &str,
-        config: &str,
-        stopper: Arc<RecordingStopper>,
-    ) -> (SocketAddr, PathBuf) {
+    async fn serve_config(name: &str, config: &str, fakes: Fakes) -> (SocketAddr, PathBuf) {
         let (_, program) = crate::tunnel::testing::running_stub(name);
         let (addr, _opener, dir) =
-            serve_all(name, config, program, std::env::temp_dir(), None, stopper).await;
+            serve_all(name, config, program, std::env::temp_dir(), None, fakes).await;
         (addr, dir)
     }
 
@@ -1387,14 +1667,14 @@ mod tests {
         let (lucy, lucy_dir) = serve_config(
             "fwd-lucy",
             &forward_config(1, 1, r#""machine_names": { "testhost": "lucy" },"#),
-            lucy_stopper.clone(),
+            Fakes::stopping(lucy_stopper.clone()),
         )
         .await;
         let megan_stopper = Arc::new(RecordingStopper::default());
         let (megan, megan_dir) = serve_config(
             "fwd-megan",
             &forward_config(socks_port, lucy.port(), ""),
-            megan_stopper.clone(),
+            Fakes::stopping(megan_stopper.clone()),
         )
         .await;
         let (status, json) = stop(megan, JDS7, &[]).await;
@@ -1422,11 +1702,16 @@ mod tests {
             fail: true,
             ..Default::default()
         });
-        let (lucy, lucy_dir) = serve_config("skew-lucy", &lucy_config, lucy_stopper.clone()).await;
+        let (lucy, lucy_dir) = serve_config(
+            "skew-lucy",
+            &lucy_config,
+            Fakes::stopping(lucy_stopper.clone()),
+        )
+        .await;
         let (megan, megan_dir) = serve_config(
             "skew-megan",
             &forward_config(socks_port, lucy.port(), ""),
-            Arc::new(RecordingStopper::default()),
+            Fakes::default(),
         )
         .await;
         let (status, json) = stop(megan, JDS7, &[]).await;
@@ -1455,7 +1740,7 @@ mod tests {
         let (megan, dir) = serve_config(
             "fwd-down",
             &forward_config(socks_port, 47654, ""),
-            stopper.clone(),
+            Fakes::stopping(stopper.clone()),
         )
         .await;
         let (status, json) = stop(megan, JDS7, &[]).await;
@@ -1466,8 +1751,12 @@ mod tests {
     }
 
     /// megan forwarding to something on lucy's WhatsUp port that answers
-    /// each request with `reply` (or, with `None`, never).
-    async fn stop_through(name: &str, reply: Option<&'static str>) -> (u16, Value) {
+    /// each request to `path` with `reply` (or, with `None`, never).
+    async fn forward_through(
+        name: &str,
+        path: &'static str,
+        reply: Option<&'static str>,
+    ) -> (u16, Value) {
         let (socks_port, _requests) =
             crate::socks::fake::start(|_, _| crate::socks::fake::Act::Relay);
         let other = StdListener::bind("127.0.0.1:0").unwrap();
@@ -1486,10 +1775,10 @@ mod tests {
         let (megan, dir) = serve_config(
             name,
             &forward_config(socks_port, other_port, ""),
-            Arc::new(RecordingStopper::default()),
+            Fakes::default(),
         )
         .await;
-        let reply = stop(megan, JDS7, &[]).await;
+        let reply = send(megan, path, JDS7, &[]).await;
         let _ = std::fs::remove_dir_all(dir);
         reply
     }
@@ -1508,7 +1797,7 @@ mod tests {
                 "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello",
             ),
         ] {
-            let (status, json) = stop_through(name, Some(reply)).await;
+            let (status, json) = forward_through(name, "/api/stop", Some(reply)).await;
             assert_eq!(status, 502, "{name}");
             assert_eq!(
                 json["error"],
@@ -1520,13 +1809,437 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stop_says_when_the_remote_takes_too_long() {
         let started = std::time::Instant::now();
-        let (status, json) = stop_through("fwd-slow", None).await;
+        let (status, json) = forward_through("fwd-slow", "/api/stop", None).await;
         assert_eq!(status, 502);
         assert_eq!(
             json["error"],
             "lucy did not answer in time; it may still be stopping"
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    fn herdr(prefix: &str, label: &str, dir: &str, run: &str) -> StartKind {
+        StartKind::Herdr {
+            prefix: prefix.into(),
+            label: label.into(),
+            dir: PathBuf::from(dir),
+            run: run.into(),
+        }
+    }
+
+    fn entry(port: u16, kind: StartKind) -> PortStart {
+        PortStart { port, kind }
+    }
+
+    /// jds2's plan when nothing is up: herdr for the links with a start
+    /// command (4002's is not its first link), docker for the three on 8002.
+    fn jds2_plan() -> Vec<PortStart> {
+        vec![
+            entry(
+                3002,
+                herdr(
+                    "h2",
+                    "portal",
+                    "~/workspace/huvr2",
+                    "tt2a && cd frontend && npm start",
+                ),
+            ),
+            entry(
+                4002,
+                herdr("h2", "tt-calc-app", "~/workspace/tt-calc-app2", "ttc2a"),
+            ),
+            entry(8002, StartKind::Docker),
+        ]
+    }
+
+    fn stop_rows() -> DashboardConfig {
+        crate::config::parse_config(STOP_CONFIG).unwrap()
+    }
+
+    #[test]
+    fn plan_start_uses_herdr_for_start_commands_and_docker_for_the_rest() {
+        let config = stop_rows();
+        let (plan, decided) = plan_start(&config.groups[1].rows[0], |_, _| false);
+        assert_eq!(plan, jds2_plan());
+        assert_eq!(decided, []);
+    }
+
+    #[test]
+    fn plan_start_skips_ports_that_are_up() {
+        let config = stop_rows();
+        let (plan, decided) = plan_start(&config.groups[1].rows[0], |host, port| {
+            host == "localhost" && port == 4002
+        });
+        let mut expected = jds2_plan();
+        expected.remove(1);
+        assert_eq!(plan, expected);
+        assert_eq!(
+            decided,
+            [PortResult {
+                port: 4002,
+                action: Action::None,
+                detail: "already up".into(),
+                error: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn plan_start_refuses_foreign_hosts_without_probing_them() {
+        let config = stop_rows();
+        let probed = std::cell::RefCell::new(Vec::new());
+        let (plan, decided) = plan_start(&config.groups[0].rows[3], |host, port| {
+            probed.borrow_mut().push((host.to_string(), port));
+            false
+        });
+        assert_eq!(plan, [entry(3004, StartKind::Docker)]);
+        assert_eq!(
+            decided,
+            [PortResult {
+                port: 8004,
+                action: Action::None,
+                detail: String::new(),
+                error: Some("192.0.2.1 is not this machine".into()),
+            }]
+        );
+        assert_eq!(probed.into_inner(), [("127.0.0.1".to_string(), 3004)]);
+    }
+
+    #[test]
+    fn link_is_up_probes_the_link_host() {
+        // A server on 127.0.0.1 behind a name that may resolve to ::1 first.
+        let v4 = StdListener::bind("127.0.0.1:0").unwrap();
+        let v4_port = v4.local_addr().unwrap().port();
+        assert!(link_is_up("localhost", v4_port));
+        assert!(is_up("localhost", v4_port));
+        // A vite on ::1 only, behind 127.0.0.1: its link host misses it, and
+        // the dashboard's own probe (both loopbacks) still sees it.
+        // 127.0.0.1 on that port is held bound and not listening, so a
+        // parallel test cannot be handed it and start answering there.
+        let (_v6, v6_port, _v4_closed) = loop {
+            let v6 = StdListener::bind("[::1]:0").unwrap();
+            let port = v6.local_addr().unwrap().port();
+            if let Some(closed) = bind_without_listening(port) {
+                break (v6, port, closed);
+            }
+        };
+        assert!(!link_is_up("127.0.0.1", v6_port));
+        assert!(is_up("127.0.0.1", v6_port));
+        assert!(!is_up("localhost", 1));
+    }
+
+    /// Binds 127.0.0.1:`port` without listening: connects there are
+    /// refused, and nothing else can bind it while the socket lives. None
+    /// when the port is taken.
+    fn bind_without_listening(port: u16) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let size = std::mem::size_of::<libc::sockaddr_in>();
+        // SAFETY: a fresh descriptor, owned at once, and a zeroed
+        // sockaddr_in filled in field by field and passed with its size.
+        unsafe {
+            let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            if fd < 0 {
+                return None;
+            }
+            let socket = OwnedFd::from_raw_fd(fd);
+            let mut address: libc::sockaddr_in = std::mem::zeroed();
+            #[cfg(target_os = "macos")]
+            {
+                address.sin_len = size as u8;
+            }
+            address.sin_family = libc::AF_INET as libc::sa_family_t;
+            address.sin_port = port.to_be();
+            address.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+            let bound = libc::bind(
+                socket.as_raw_fd(),
+                (&address as *const libc::sockaddr_in).cast::<libc::sockaddr>(),
+                size as libc::socklen_t,
+            );
+            (bound == 0).then_some(socket)
+        }
+    }
+
+    const JDS2: &str = r#"{"group":"pc","row":0,"ports":[3002,4002,8002]}"#;
+
+    async fn serve_start(name: &str, starter: Arc<RecordingStarter>) -> (SocketAddr, PathBuf) {
+        serve_config(
+            &format!("start-{name}"),
+            STOP_CONFIG,
+            Fakes::starting(starter),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_runs_the_rows_plan() {
+        let starter = Arc::new(RecordingStarter::default());
+        let (addr, dir) = serve_start("runs", starter.clone()).await;
+        let (status, json) = start(addr, JDS2, &[]).await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(starter.plans(), [jds2_plan()]);
+        assert_eq!(
+            json,
+            json!({ "ok": true, "results": [
+                { "port": 3002, "action": "herdr", "detail": "started", "error": null },
+                { "port": 4002, "action": "herdr", "detail": "started", "error": null },
+                { "port": 8002, "action": "compose", "detail": "started", "error": null },
+            ] })
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_skips_ports_that_are_up() {
+        let live = StdListener::bind("127.0.0.1:0").unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        // Port 1 is never listened on (see the dashboard status test).
+        let config = format!(
+            r#"{{ "groups": [{{ "id": "g", "label": "G", "columns": ["Down", "Up"],
+                "rows": [{{ "cells": [
+                    {{ "label": "down", "url": "http://localhost:1/" }},
+                    {{ "label": "up", "url": "http://127.0.0.1:{live_port}/" }}
+                ] }}] }}] }}"#
+        );
+        let starter = Arc::new(RecordingStarter::default());
+        let fakes = Fakes {
+            starter: starter.clone(),
+            real_probe: true,
+            ..Default::default()
+        };
+        let (addr, dir) = serve_config("start-up", &config, fakes).await;
+        let body = format!(r#"{{"group":"g","row":0,"ports":[1,{live_port}]}}"#);
+        let (status, json) = start(addr, &body, &[]).await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(starter.plans(), [vec![entry(1, StartKind::Docker)]]);
+        assert_eq!(
+            json["results"],
+            json!([
+                { "port": 1, "action": "compose", "detail": "started", "error": null },
+                { "port": live_port, "action": "none", "detail": "already up", "error": null },
+            ])
+        );
+        let _keep = live;
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_reports_joined_errors() {
+        let starter = Arc::new(RecordingStarter {
+            fail: Some(4002),
+            ..Default::default()
+        });
+        let (addr, dir) = serve_start("fails", starter).await;
+        let (status, json) = start(addr, JDS2, &[]).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"], "port 4002: boom");
+        assert_eq!(json["results"][0]["error"], Value::Null);
+        assert_eq!(json["results"][1]["error"], "boom");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_refuses_other_sites() {
+        let starter = Arc::new(RecordingStarter::default());
+        let (addr, dir) = serve_start("guard", starter.clone()).await;
+        let forbidden: [&[(&str, &str)]; 2] =
+            [&[("Origin", "http://evil.test")], &[("Host", "evil.test")]];
+        for headers in forbidden {
+            let (status, json) = start(addr, JDS2, headers).await;
+            assert_eq!(status, 403, "{headers:?}");
+            assert_eq!(json["error"], "starts must come from this dashboard");
+        }
+        assert!(starter.plans().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_row_checks() {
+        let starter = Arc::new(RecordingStarter::default());
+        let (addr, dir) = serve_start("checks", starter.clone()).await;
+        let (status, json) = start(addr, "not json", &[]).await;
+        assert_eq!(status, 400);
+        let error = json["error"].as_str().unwrap();
+        assert!(error.starts_with("not a start request: "), "{error}");
+        for (body, error) in [
+            (
+                r#"{"machine":"nope","group":"pc","row":0,"ports":[3002,4002,8002]}"#,
+                "unknown machine nope",
+            ),
+            (
+                r#"{"group":"g","row":0,"ports":[]}"#,
+                "that row has nothing to start",
+            ),
+        ] {
+            assert_eq!(
+                start(addr, body, &[]).await,
+                (400, json!({ "error": error }))
+            );
+        }
+        for body in [
+            r#"{"group":"pc","row":0,"ports":[3002,4002]}"#,
+            r#"{"group":"pc","row":1,"ports":[3002,4002,8002]}"#,
+        ] {
+            let (status, json) = start(addr, body, &[]).await;
+            assert_eq!(status, 409, "{body}");
+            assert_eq!(json["error"], CONFIG_CHANGED);
+        }
+        assert!(starter.plans().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_and_stop_share_the_busy_mark() {
+        let (stopper, release_stop) = gated();
+        let (release_start, gate) = std::sync::mpsc::channel();
+        let starter = Arc::new(RecordingStarter {
+            gate: Mutex::new(Some(gate)),
+            ..Default::default()
+        });
+        let fakes = Fakes {
+            stopper: stopper.clone(),
+            starter: starter.clone(),
+            real_probe: false,
+        };
+        let (addr, dir) = serve_config("busy", STOP_CONFIG, fakes).await;
+
+        let stopping = tokio::spawn(async move { stop(addr, JDS4, &[]).await });
+        until("the stop started", || stopper.calls().len() == 1).await;
+        let (status, json) = start(addr, JDS4, &[]).await;
+        assert_eq!((status, &json["error"]), (409, &json!("already stopping")));
+        release_stop.send(()).unwrap();
+        assert_eq!(stopping.await.unwrap().0, 200);
+
+        let starting = tokio::spawn(async move { start(addr, JDS4, &[]).await });
+        until("the start started", || starter.plans().len() == 1).await;
+        let (status, json) = stop(addr, JDS4, &[]).await;
+        assert_eq!((status, &json["error"]), (409, &json!("already starting")));
+        release_start.send(()).unwrap();
+        assert_eq!(starting.await.unwrap().0, 200);
+
+        assert_eq!(stopper.calls().len(), 1);
+        assert_eq!(starter.plans().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_refuses_foreign_hosts() {
+        let starter = Arc::new(RecordingStarter::default());
+        let (addr, dir) = serve_start("foreign", starter.clone()).await;
+        let body = r#"{"group":"g","row":3,"ports":[3004,8004]}"#;
+        let (status, json) = start(addr, body, &[]).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"], "port 8004: 192.0.2.1 is not this machine");
+        assert_eq!(starter.plans(), [vec![entry(3004, StartKind::Docker)]]);
+        assert_eq!(json["results"][0]["action"], "compose");
+        assert_eq!(json["results"][1]["action"], "none");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn start_forwards_to_the_remote() {
+        let (socks_port, _requests) =
+            crate::socks::fake::start(|_, _| crate::socks::fake::Act::Relay);
+        let lucy_starter = Arc::new(RecordingStarter::default());
+        let (lucy, lucy_dir) = serve_config(
+            "start-fwd-lucy",
+            &forward_config(1, 1, r#""machine_names": { "testhost": "lucy" },"#),
+            Fakes::starting(lucy_starter.clone()),
+        )
+        .await;
+        let megan_starter = Arc::new(RecordingStarter::default());
+        let (megan, megan_dir) = serve_config(
+            "start-fwd-megan",
+            &forward_config(socks_port, lucy.port(), ""),
+            Fakes::starting(megan_starter.clone()),
+        )
+        .await;
+        let (status, json) = start(megan, JDS7, &[]).await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(
+            json["results"],
+            json!([{ "port": 3007, "action": "herdr", "detail": "started", "error": null }])
+        );
+        assert_eq!(
+            lucy_starter.plans(),
+            [vec![entry(
+                3007,
+                herdr("h7", "portal7", "~/workspace/huvr7", "tt7a")
+            )]]
+        );
+        assert!(megan_starter.plans().is_empty());
+        let _ = std::fs::remove_dir_all(lucy_dir);
+        let _ = std::fs::remove_dir_all(megan_dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_forward_to_old_whatsup() {
+        let old = "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n";
+        let (status, json) = forward_through("start-fwd-old", "/api/start", Some(old)).await;
+        assert_eq!(status, 502);
+        assert_eq!(
+            json["error"],
+            "WhatsUp on lucy cannot start stacks; update it"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_forward_errors() {
+        let (socks_port, _requests) =
+            crate::socks::fake::start(|_, _| crate::socks::fake::Act::Close);
+        let starter = Arc::new(RecordingStarter::default());
+        let (megan, dir) = serve_config(
+            "start-fwd-down",
+            &forward_config(socks_port, 47654, ""),
+            Fakes::starting(starter.clone()),
+        )
+        .await;
+        let (status, json) = start(megan, JDS7, &[]).await;
+        assert_eq!(status, 502);
+        assert_eq!(json["error"], "WhatsUp is not running on lucy");
+        assert!(starter.plans().is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+
+        let started = std::time::Instant::now();
+        let (status, json) = forward_through("start-fwd-slow", "/api/start", None).await;
+        assert_eq!(status, 502);
+        assert_eq!(
+            json["error"],
+            "lucy did not answer in time; it may still be starting"
+        );
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        // Connected and closed without a reply, or answered with something
+        // that is not HTTP: not a timeout, so say what happened.
+        for (name, reply, reason) in [
+            (
+                "start-fwd-closed",
+                "",
+                "the connection closed without a reply",
+            ),
+            ("start-fwd-garbage", "hello\r\n", "the reply is not http"),
+        ] {
+            let (status, json) = forward_through(name, "/api/start", Some(reply)).await;
+            assert_eq!(status, 502, "{name}");
+            assert_eq!(
+                json["error"],
+                format!("lucy did not reply to the start: {reason}"),
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dashboard_has_row_ids_and_can_act() {
+        let (addr, dir) = serve_start("dashboard", Arc::default()).await;
+        let json = dashboard_json(addr).await;
+        let machine = &json["machines"][0];
+        assert_eq!(machine["can_act"], true);
+        assert!(machine.get("can_stop").is_none(), "{machine}");
+        let rows = &json["groups"][0]["rows"];
+        assert_eq!(rows[0].get("id"), Some(&Value::Null));
+        assert_eq!(rows[1]["id"], "jds4");
+        assert_eq!(json["groups"][1]["rows"][0]["id"], "jds2");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1719,6 +2432,7 @@ mod tests {
             Actions {
                 opener: opener.clone(),
                 stopper: Arc::new(RecordingStopper::default()),
+                starter: Arc::new(RecordingStarter::default()),
             },
             shutdown,
             HOSTNAME.to_string(),

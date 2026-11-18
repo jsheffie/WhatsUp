@@ -12,6 +12,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::time::Duration;
 
+use crate::http::exchange;
+pub use crate::http::PostError;
+
 /// How long each stage (connect, greeting, reply) may take.
 pub const REMOTE_TIMEOUT: Duration = Duration::from_millis(1500);
 
@@ -100,15 +103,6 @@ pub fn socks_connect(
     Ok(stream)
 }
 
-/// Why [`post_json`] has no reply to give.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PostError {
-    /// The tunnel is down, or nothing listens on the remote port.
-    Connect,
-    /// Connected, but no complete HTTP reply came back.
-    Reply(String),
-}
-
 /// POSTs a JSON `body` to the WhatsUp listening on the remote machine's
 /// loopback `port`, through the tunnel, and returns the status and body of
 /// its reply. The connection is used once (`Connection: close`).
@@ -119,31 +113,9 @@ pub fn post_json(
     body: &str,
     read_timeout: Duration,
 ) -> Result<(u16, String), PostError> {
-    let mut stream = socks_connect(socks_port, "127.0.0.1", port, REMOTE_TIMEOUT)
+    let stream = socks_connect(socks_port, "127.0.0.1", port, REMOTE_TIMEOUT)
         .map_err(|_| PostError::Connect)?;
-    stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(|err| PostError::Reply(err.to_string()))?;
-    write!(
-        stream,
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    )
-    .map_err(|err| PostError::Reply(format!("could not send the request: {err}")))?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|err| PostError::Reply(format!("no reply: {err}")))?;
-    let response = String::from_utf8_lossy(&response);
-    let (head, body) = response
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| PostError::Reply("the reply is not http".into()))?;
-    let status = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|code| code.parse::<u16>().ok())
-        .ok_or_else(|| PostError::Reply("the reply is not http".into()))?;
-    Ok((status, body.to_string()))
+    exchange(stream, "POST", port, path, Some(body), read_timeout)
 }
 
 /// Probes every distinct (host, port) through the tunnel at once.

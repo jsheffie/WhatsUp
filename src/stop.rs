@@ -19,6 +19,7 @@ pub enum Action {
     Process,
     Compose,
     Container,
+    Herdr,
     None,
 }
 
@@ -28,6 +29,7 @@ impl Action {
             Action::Process => "process",
             Action::Compose => "compose",
             Action::Container => "container",
+            Action::Herdr => "herdr",
             Action::None => "none",
         }
     }
@@ -118,6 +120,84 @@ fn parse_listener_pids(output: &str) -> Vec<u32> {
         }
     }
     pids
+}
+
+/// Runs docker with `args`; the error is its last line of stderr.
+pub(crate) fn run_docker(
+    docker: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    run_docker_as(docker, args, timeout, &format!("docker {}", args.join(" ")))
+}
+
+/// Runs docker with `args`; the error is `shown`, then its last line of
+/// stderr.
+pub(crate) fn run_docker_as(
+    docker: &Path,
+    args: &[&str],
+    timeout: Duration,
+    shown: &str,
+) -> Result<String, String> {
+    let mut command = Command::new(docker);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // docker runs helpers (compose, credential stores) from its own
+    // directory, which a Finder-started app does not have on PATH.
+    if let Some(dir) = docker.parent() {
+        let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect())
+            .unwrap_or_default();
+        dirs.push(dir.to_path_buf());
+        if let Ok(path) = std::env::join_paths(dirs) {
+            command.env("PATH", path);
+        }
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| format!("{shown}: could not run: {err}"))?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_string(&mut text);
+            }
+            text
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{shown}: gave up after {} s",
+                    timeout.as_secs_f32()
+                ));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(err) => return Err(format!("{shown}: {err}")),
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if status.success() {
+        return Ok(stdout);
+    }
+    let reason = stderr
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| status.to_string());
+    Err(format!("{shown}: {reason}"))
 }
 
 /// Whether a `docker ps` Ports column maps host `port` to a container.
@@ -339,70 +419,6 @@ fn describe(signals: &BTreeSet<Signal>) -> String {
 }
 
 impl SystemStopper {
-    /// Runs docker with `args`; the error is its last line of stderr.
-    fn docker(&self, docker: &Path, args: &[&str], timeout: Duration) -> Result<String, String> {
-        let shown = format!("docker {}", args.join(" "));
-        let mut command = Command::new(docker);
-        command
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // docker runs helpers (compose, credential stores) from its own
-        // directory, which a Finder-started app does not have on PATH.
-        if let Some(dir) = docker.parent() {
-            let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
-                .map(|path| std::env::split_paths(&path).collect())
-                .unwrap_or_default();
-            dirs.push(dir.to_path_buf());
-            if let Ok(path) = std::env::join_paths(dirs) {
-                command.env("PATH", path);
-            }
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|err| format!("{shown}: could not run: {err}"))?;
-        let drain = |pipe: Option<Box<dyn Read + Send>>| {
-            std::thread::spawn(move || {
-                let mut text = String::new();
-                if let Some(mut pipe) = pipe {
-                    let _ = pipe.read_to_string(&mut text);
-                }
-                text
-            })
-        };
-        let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
-        let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
-        let deadline = Instant::now() + timeout;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{shown}: gave up after {} s",
-                        timeout.as_secs_f32()
-                    ));
-                }
-                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                Err(err) => return Err(format!("{shown}: {err}")),
-            }
-        };
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
-        if status.success() {
-            return Ok(stdout);
-        }
-        let reason = stderr
-            .lines()
-            .map(str::trim)
-            .rfind(|line| !line.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| status.to_string());
-        Err(format!("{shown}: {reason}"))
-    }
-
     fn target_of(&self, port: u16, containers: Option<&str>) -> Target {
         if let Some((id, project)) = containers.and_then(|ps| docker_owner(ps, port)) {
             return if project.is_empty() {
@@ -464,7 +480,7 @@ impl SystemStopper {
 
     fn docker_stop(&self, args: &[&str]) -> Result<(), String> {
         let docker = self.docker.as_deref().ok_or("docker was not found")?;
-        self.docker(docker, args, self.command_timeout).map(|_| ())
+        run_docker(docker, args, self.command_timeout).map(|_| ())
     }
 }
 
@@ -473,7 +489,7 @@ impl Stopper for SystemStopper {
         // A docker that is missing or not answering publishes nothing; a
         // port it does hold is then refused by name instead of signalled.
         let containers = self.docker.as_deref().and_then(|docker| {
-            self.docker(
+            run_docker(
                 docker,
                 &["ps", "--no-trunc", "--format", DOCKER_PS_FORMAT],
                 self.list_timeout,
@@ -520,7 +536,7 @@ impl Stopper for SystemStopper {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::{Ipv4Addr, TcpListener};
     use std::os::unix::fs::PermissionsExt;
@@ -572,14 +588,14 @@ mod tests {
         assert_eq!(docker_owner("", 8004), None);
     }
 
-    fn temp_dir(name: &str) -> PathBuf {
+    pub(crate) fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("whatsup-stop-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn script(path: &Path, body: &str) {
+    pub(crate) fn script(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();

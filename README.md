@@ -86,7 +86,7 @@ One-time profile setup:
 
 ## Stopping a stack
 
-Every row with links has a Stop button. Click it, then click Confirm within 4 seconds. Stop means "stop whatever serves this row's ports":
+Every row with links has a Stop button beside its Start button. Click it, then click Confirm within 4 seconds. Stop means "stop whatever serves this row's ports":
 
 - A port published by docker: `docker compose -p <project> stop` for the container's compose project (so its database and other services stop too), or `docker stop` for a container outside compose. Containers are stopped, never removed.
 - Any other listener: SIGTERM to its process group, then SIGKILL if the port is still open after 5 seconds. The group is the server plus the `npm` / `just` / `pnpm` that started it, not the shell or terminal it was started from. When the group also holds unrelated processes, only the listener itself is signalled.
@@ -94,7 +94,38 @@ Every row with links has a Stop button. Click it, then click Confirm within 4 se
 
 Things the dashboard has no port for are not found: a second dev server on another port, a container without a published port, or the database of a compose project whose web container is already down.
 
-Rows of a remote machine are stopped by the WhatsUp running on that machine: the request goes through the remote's tunnel to its WhatsUp on `127.0.0.1:47654`. So WhatsUp must be running there, in the same version or newer, with the same config. Add `"whatsup_port": <port>` to the remote's entry if its WhatsUp was started with `--port`. When the remote's WhatsUp does not answer, its Stop buttons are disabled and say so.
+Rows of a remote machine are stopped by the WhatsUp running on that machine: the request goes through the remote's tunnel to its WhatsUp on `127.0.0.1:47654`. So WhatsUp must be running there, in the same version or newer, with the same config. Add `"whatsup_port": <port>` to the remote's entry if its WhatsUp was started with `--port`. When the remote's WhatsUp does not answer, its Start and Stop buttons are disabled and say so.
+
+## Starting a stack
+
+Every row with links has a Start button beside Stop. It starts whatever of the row is not running, with one click. Ports that are already up are left alone, and only ports whose links point at the machine itself are started.
+
+- A port published by docker: `docker compose -p <project> start` for the compose project of the container that publishes it, or `docker start` for a container outside compose. It uses the existing, stopped containers (they keep their port bindings), so it needs no config. Containers are never created.
+- A link with a `start` in the config: the command runs in a herdr tab named after the link, in the row's herdr workspace (the first one matching the row's `herdr` prefix, created if none matches). A tab with that name is reused when its shell is idle, and refused ("busy; it may still be starting") when it is not; otherwise a tab is created. WhatsUp types this one line into the tab's interactive shell, so aliases like `tt2a` work and the logs stay in the tab:
+  `cd -- '<dir>' && { <run>; }; echo "[whatsup <nonce>] exited with $?"`
+- When the command fails (a nonzero exit code) within 5 seconds, Start reports the code and the last lines of output instead of success. Exiting 0 within those 5 seconds counts as started ("<run> finished"); the ports then say whether the row came up. If herdr stops answering after the command was typed, Start still reports the port as started, with "could not watch it start".
+- A port with no `start` and no container publishing it fails with "no start command, and no container publishes it". Several containers publishing it fails with "several containers publish it: <names>".
+- The button reads Starting... until every port it started is up, or for 3 minutes, after which the banner names what is still down and where to look: its herdr tab, or docker.
+
+Rows of a remote machine are started by the WhatsUp running on that machine (same tunnel and requirements as Stop). A request names a row, never a command: each WhatsUp runs only commands from its own config.
+
+```json
+{ "id": "jds2", "tone": "gray", "cells": [
+  "huvr2, tt-calc-app2",
+  { "text": "jds2", "herdr": "h2" },
+  { "label": "jds2 portal", "url": "http://jds2.local.me:3002", "port": 3002,
+    "start": { "dir": "~/workspace/huvr2", "run": "tt2a && cd frontend && npm start" } }
+] }
+```
+
+- `start.dir` is absolute or starts with `~/` (the home of the machine that runs it). `start.run` is one line of shell text, without tabs or other control characters, that does not end with `;`, `&` or `|` (typed inside `{ <run>; }`, those would run nothing).
+- `id` on a row is its name for the [command line](#command-line): 1 to 32 characters of `A-Za-z0-9_-`, unique across all rows (case ignored).
+- The config is rejected when a row has a `start` but no herdr cell (the workspace has no name), when two links of a row on the same port both have a `start`, or when an `id`, `dir` or `run` is invalid.
+- A row is either starting or stopping, never both.
+
+A server may still be booting in its tab after Start returns, and a Stop then finds nothing on its port. Wait for the row to come up before stopping it, or press Ctrl-C in the tab.
+
+Rollout: older versions reject unknown fields, so install the new WhatsUp on every machine before adding `start` or `id` to a shared config.
 
 ## herdr workspace labels
 
@@ -108,4 +139,33 @@ When a stack runs in its own herdr workspace, the dashboard can show that worksp
 - Each machine's section uses that machine's herdr (its default session). With several matches, the cell shows the first one in herdr's sidebar order plus `+N`, and the tooltip lists them all.
 - On this machine WhatsUp reads `$XDG_CONFIG_HOME/herdr/herdr.sock`, else `~/.config/herdr/herdr.sock`.
 - For a remote, add `"herdr_socket": "/home/<user>/.config/herdr/herdr.sock"` (absolute) to its entry. WhatsUp forwards that socket over the remote's tunnel to `herdr-<socks_port>.sock` in its own directory.
-- WhatsUp only ever sends herdr's read-only `workspace.list` request. If herdr is not running or does not answer within a second, the cell shows its plain text.
+- For the labels WhatsUp sends only herdr's read-only `workspace.list` request. Start (see above) also creates workspaces and tabs, reads panes and types the configured command, but only on this machine's herdr socket and only on a Start request. The forwarded socket of a remote is still only read. If herdr is not running or does not answer within a second, the cell shows its plain text.
+
+## Command line
+
+The same binary starts and stops rows from a terminal, for people and agents. It talks to the running WhatsUp over HTTP (the port comes from the instance file, or `--port`), so rows of a remote machine are forwarded exactly as the buttons do.
+
+```
+whatsup list  [--json] [--port <port>]
+whatsup start <row> [--machine <name>] [--wait] [--timeout <secs>] [--json] [--port <port>]
+whatsup stop  <row> [--machine <name>] [--json] [--port <port>]
+```
+
+- `<row>` is a row `id` (case ignored) or `<group>/<index>` using the config index. `--machine` defaults to this machine.
+- Options go after the command. Before a command, `--port` is the port to listen on; after it, the port of the running WhatsUp.
+- `list` prints, for each machine, a summary line such as `megan 12/33 up` (marked `(offline)` or `(WhatsUp not running there)` when so), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
+- `start` and `stop` print one line per port (`3002  herdr   herdr tab jds2 portal in h2`). `stop` acts at once, with no confirmation.
+- `start --wait` then polls until every port it started is up, or `--timeout` seconds (default 180) pass. `--json` prints the server's reply as is.
+- Exit codes: 0 success; 1 the action failed or timed out; 2 usage, unknown row, or WhatsUp not running.
+
+```sh
+whatsup list                      # find the row id
+whatsup start jds2 --wait         # exits 0 once jds2 is up
+whatsup stop jds2 --machine lucy
+```
+
+Linux installs `~/.local/bin/whatsup`. On macOS the binary is inside the app; link it into your `PATH`:
+
+```sh
+ln -s ~/Applications/WhatsUp.app/Contents/MacOS/whatsup ~/.local/bin/whatsup
+```

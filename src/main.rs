@@ -9,9 +9,11 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 
 use whatsup::browser::open_in_browser;
+use whatsup::cli;
 use whatsup::config::{config_dir, load_config, resolve_config_path, runtime_dir};
 use whatsup::instance;
 use whatsup::server::{router, Actions, AppState, SystemOpener};
+use whatsup::start::SystemStarter;
 use whatsup::stop::SystemStopper;
 use whatsup::tunnel::Tunnels;
 use whatsup::PREFERRED_PORT;
@@ -23,7 +25,13 @@ struct Args {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    // The command line talks to the running WhatsUp: no config, no instance
+    // lock, no browser.
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| cli::is_command(arg)) {
+        return ExitCode::from(cli::run(args));
+    }
+    match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("whatsup: {err}");
@@ -32,8 +40,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
-    let args = parse_args(env::args().skip(1))?;
+fn run(args: Vec<String>) -> Result<(), String> {
+    let args = parse_args(args)?;
     let config_path = resolve_config_path(args.config)?;
     let config = load_config(&config_path)?;
     let instance_path = instance::instance_path()?;
@@ -87,17 +95,21 @@ fn run() -> Result<(), String> {
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let tunnels = Arc::new(Tunnels::new(PathBuf::from("ssh"), runtime_dir.clone()));
+        let hostname = short_hostname();
+        let local_herdr = whatsup::herdr::local_socket(&|key| env::var_os(key));
+        let starter = SystemStarter::new(local_herdr.clone(), config.machine_label(&hostname));
         let state = AppState::new(
             config_path,
             config.clone(),
             Actions {
                 opener: Arc::new(SystemOpener),
                 stopper: Arc::new(SystemStopper::new()),
+                starter: Arc::new(starter),
             },
             shutdown_tx,
-            short_hostname(),
+            hostname,
             tunnels.clone(),
-            whatsup::herdr::local_socket(&|key| env::var_os(key)),
+            local_herdr,
         );
         let app = router(state);
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -180,7 +192,8 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     .map(|dir| dir.join("config.json").display().to_string())
                     .unwrap_or_else(|err| format!("(unavailable: {err})"));
                 println!(
-                    "WhatsUp\n\n  whatsup [--config PATH] [--port PORT] [--no-open]\n\nThe dashboard config is JSON. cargo run reads config/whatsup.json.\nAn installed WhatsUp reads {user_config}."
+                    "WhatsUp\n\nUsage:\n  whatsup [--config <path>] [--port <port>] [--no-open]\n{}\n\nThe dashboard config is JSON. cargo run reads config/whatsup.json.\nAn installed WhatsUp reads {user_config}.",
+                    cli::USAGE
                 );
                 std::process::exit(0);
             }
