@@ -18,6 +18,7 @@ use crate::config::{
     config_mtime, load_config, Cell, DashboardConfig, Group, Link, Remote, Row, Tone,
 };
 use crate::herdr::{list_workspaces, matching_labels, HerdrWorkspace, QUERY_BUDGET};
+use crate::load::{self, Load};
 use crate::probe::{port_is_open, probe_ports, CONNECT_TIMEOUT};
 use crate::socks::{post_json, probe_remote, PostError, Reach};
 use crate::start::{PortStart, StartKind, Starter};
@@ -65,9 +66,14 @@ struct Inner {
     /// How long a stop or start forwarded to a remote WhatsUp may take.
     stop_forward_timeout: Duration,
     start_forward_timeout: Duration,
+    /// This machine's latest load sample.
+    load: LoadReader,
 }
 
 type Probe = Arc<dyn Fn(&str, u16) -> bool + Send + Sync>;
+
+/// Reads this machine's latest load sample.
+pub type LoadReader = Arc<dyn Fn() -> Load + Send + Sync>;
 
 /// What the dashboard does to the machine it runs on.
 pub struct Actions {
@@ -110,6 +116,7 @@ impl AppState {
                 busy: Arc::default(),
                 stop_forward_timeout: STOP_FORWARD_TIMEOUT,
                 start_forward_timeout: START_FORWARD_TIMEOUT,
+                load: Arc::new(Load::default),
             }),
         }
     }
@@ -131,6 +138,13 @@ impl AppState {
     /// before the state is shared.
     pub fn with_probe(mut self, probe: Probe) -> Self {
         self.unshared().probe = probe;
+        self
+    }
+
+    /// Replaces where this machine's load comes from (the sampler in main,
+    /// a fixture in tests). Only before the state is shared.
+    pub fn with_load(mut self, load: LoadReader) -> Self {
+        self.unshared().load = load;
         self
     }
 
@@ -169,6 +183,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/api/dashboard", get(dashboard))
+        .route("/api/load", get(machine_load))
         .route("/api/open", post(open_link))
         .route("/api/start", post(start_row))
         .route("/api/stop", post(stop_row))
@@ -178,6 +193,11 @@ pub fn router(state: AppState) -> Router {
 
 async fn index() -> Html<&'static str> {
     Html(DASHBOARD_HTML)
+}
+
+/// This machine's latest load sample, which a remote dashboard shows.
+async fn machine_load(State(state): State<AppState>) -> Json<Load> {
+    Json((state.inner.load)())
 }
 
 async fn dashboard(State(state): State<AppState>) -> Json<Value> {
@@ -226,6 +246,8 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
         counts: (0, 0),
         can_act: true,
         herdr: herdr_result(local_herdr).await,
+        load: Some((state.inner.load)()),
+        load_note: None,
     }];
     machines[0].counts = count_local(&config, &machines[0]);
     for ((remote, probe), herdr) in remotes.iter().zip(remote_probes).zip(remote_herdr) {
@@ -258,6 +280,8 @@ async fn dashboard(State(state): State<AppState>) -> Json<Value> {
             counts,
             can_act,
             herdr: herdr_result(herdr).await,
+            load: None,
+            load_note: None,
         });
     }
     Json(view(&config, &machines, &path, error))
@@ -289,6 +313,10 @@ struct MachineStatus {
     can_act: bool,
     /// The machine's herdr workspaces, when they could be read.
     herdr: Option<Vec<HerdrWorkspace>>,
+    /// The machine's CPU, memory and disk use, when known.
+    load: Option<Load>,
+    /// Why a remote machine's load is missing, when the user can fix it.
+    load_note: Option<String>,
 }
 
 async fn herdr_result(
@@ -793,6 +821,8 @@ fn view(
             "ports_up": machine.counts.0,
             "ports_total": machine.counts.1,
             "can_act": machine.can_act,
+            "load": machine.load.as_ref().map(load::view),
+            "load_note": machine.load_note,
         })).collect::<Vec<_>>(),
         "groups": machines
             .iter()
@@ -965,6 +995,7 @@ mod tests {
         stopper: Arc<RecordingStopper>,
         starter: Arc<RecordingStarter>,
         real_probe: bool,
+        load: Option<LoadReader>,
     }
 
     impl Fakes {
@@ -1046,6 +1077,9 @@ mod tests {
         .with_forward_timeout(Duration::from_millis(500));
         if !fakes.real_probe {
             state = state.with_probe(Arc::new(|_, _| false));
+        }
+        if let Some(load) = fakes.load {
+            state = state.with_load(load);
         }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1263,11 +1297,62 @@ mod tests {
                 "ports_up": json["ports_up"],
                 "ports_total": json["ports_total"],
                 "can_act": true,
+                "load": { "cpu": null, "memory": null, "disk": null },
+                "load_note": null,
             }])
         );
         assert_eq!(json["groups"][0]["machine"], HOSTNAME);
         assert_eq!(json["groups"][0]["key"], format!("{HOSTNAME}/web-stacks"));
         assert_eq!(json["groups"][0]["id"], "web-stacks");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    fn load_fixture() -> crate::load::Load {
+        crate::load::Load {
+            cpu: Some(crate::load::Cpu {
+                percent: 23.0,
+                cores: 12,
+            }),
+            memory: Some(crate::load::Memory {
+                percent: 50.0,
+                total: 36 << 30,
+                swap_used: 468 << 20,
+            }),
+            disk: Some(crate::load::Disk {
+                percent: 88.4,
+                total: 460 << 30,
+                free: 53 << 30,
+                path: "/Users/jds".into(),
+            }),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_load_is_in_the_view() {
+        let (_, program) = crate::tunnel::testing::running_stub("server-local-load");
+        let fakes = Fakes {
+            load: Some(Arc::new(load_fixture)),
+            ..Default::default()
+        };
+        let (addr, _opener, dir) = serve_all(
+            "local-load",
+            crate::DEFAULT_CONFIG_JSON,
+            program,
+            std::env::temp_dir(),
+            None,
+            fakes,
+        )
+        .await;
+        let json = dashboard_json(addr).await;
+        let machine = &json["machines"][0];
+        assert_eq!(machine["load"]["disk"]["level"], "warn");
+        assert_eq!(machine["load"]["cpu"]["percent"], 23.0);
+        assert_eq!(machine["load_note"], Value::Null);
+        let body = tokio::task::spawn_blocking(move || http(addr, "GET", "/api/load", None).1)
+            .await
+            .unwrap();
+        let served: crate::load::Load = serde_json::from_str(body_of(&body)).unwrap();
+        assert_eq!(served, load_fixture());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -2099,6 +2184,7 @@ mod tests {
             stopper: stopper.clone(),
             starter: starter.clone(),
             real_probe: false,
+            load: None,
         };
         let (addr, dir) = serve_config("busy", STOP_CONFIG, fakes).await;
 

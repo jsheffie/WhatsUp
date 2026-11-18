@@ -1,7 +1,10 @@
 //! How busy this machine is: CPU, memory and disk use, read straight from
 //! the operating system.
 
-use std::path::Path;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -55,6 +58,87 @@ pub fn cpu_percent(earlier: Ticks, later: Ticks) -> Option<f64> {
         return None;
     }
     Some(100.0 * busy as f64 / all as f64)
+}
+
+/// How often a WhatsUp samples its machine.
+pub const SAMPLE_EVERY: Duration = Duration::from_secs(2);
+/// How many samples CPU use is averaged over (10 s at `SAMPLE_EVERY`), so a
+/// short spike does not flash red.
+pub const CPU_WINDOW: usize = 5;
+
+/// The last few CPU readings, giving the average across them.
+pub struct CpuWindow {
+    ticks: VecDeque<Ticks>,
+    intervals: usize,
+}
+
+impl CpuWindow {
+    pub fn new(intervals: usize) -> Self {
+        Self {
+            ticks: VecDeque::with_capacity(intervals + 1),
+            intervals,
+        }
+    }
+
+    /// Adds a reading and returns the percent busy from the oldest kept
+    /// reading to this one.
+    pub fn push(&mut self, ticks: Ticks) -> Option<f64> {
+        self.ticks.push_back(ticks);
+        while self.ticks.len() > self.intervals + 1 {
+            self.ticks.pop_front();
+        }
+        cpu_percent(*self.ticks.front()?, ticks)
+    }
+
+    pub fn oldest(&self) -> Option<Ticks> {
+        self.ticks.front().copied()
+    }
+}
+
+/// Samples this machine on its own thread, every `SAMPLE_EVERY`, and keeps
+/// the latest sample for whoever asks.
+pub struct LoadMonitor {
+    latest: Mutex<Load>,
+}
+
+impl LoadMonitor {
+    /// Starts sampling now. Disk use is that of the filesystem holding
+    /// `disk_path`.
+    pub fn start(disk_path: PathBuf) -> Arc<LoadMonitor> {
+        let monitor = Arc::new(LoadMonitor {
+            latest: Mutex::default(),
+        });
+        let shared = monitor.clone();
+        let spawned = std::thread::Builder::new()
+            .name("whatsup-load".into())
+            .spawn(move || {
+                let cores = std::thread::available_parallelism()
+                    .map(|cores| cores.get() as u32)
+                    .unwrap_or(1);
+                let mut window = CpuWindow::new(CPU_WINDOW);
+                loop {
+                    let cpu = read_ticks()
+                        .ok()
+                        .and_then(|ticks| window.push(ticks))
+                        .map(|percent| Cpu { percent, cores });
+                    let load = Load {
+                        cpu,
+                        memory: read_memory().ok(),
+                        disk: read_disk(&disk_path).ok(),
+                    };
+                    *shared.latest.lock().expect("load lock") = load;
+                    std::thread::sleep(SAMPLE_EVERY);
+                }
+            });
+        if let Err(err) = spawned {
+            eprintln!("whatsup: cannot sample this machine's load: {err}");
+        }
+        monitor
+    }
+
+    pub fn latest(&self) -> Load {
+        self.latest.lock().expect("load lock").clone()
+    }
 }
 
 /// The machine-wide `cpu` line of `/proc/stat`. Busy is everything but idle
@@ -441,6 +525,23 @@ mod tests {
         assert_eq!(busy["cpu"]["level"], "high");
         assert_eq!(busy["cpu"]["cores"], 12);
         assert_eq!(busy["memory"]["level"], "warn");
+    }
+
+    #[test]
+    fn cpu_window_averages_over_the_window() {
+        let mut window = CpuWindow::new(5);
+        let tick = |all: u64| Ticks { busy: all / 2, all };
+        assert_eq!(window.push(tick(0)), None);
+        for all in [100, 200, 300, 400, 500] {
+            assert_eq!(window.push(tick(all)), Some(50.0));
+        }
+        // The 7th push drops the first tick: the window starts at 100.
+        let busy = Ticks {
+            busy: 50 + 600,
+            all: 700,
+        };
+        assert_eq!(window.push(busy), Some(100.0 * 600.0 / 600.0));
+        assert_eq!(window.oldest(), Some(tick(100)));
     }
 
     #[test]
