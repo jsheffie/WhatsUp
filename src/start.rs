@@ -163,30 +163,45 @@ pub fn launch(
         }
     }
 
+    let started = format!("herdr tab {label} in {workspace}");
+    let unwatched = format!("{started}; could not watch it start");
     let nonce = nonce();
-    herdr()?
-        .type_line(&pane, &typed_line(dir, run, &nonce))
-        .map_err(failed)?;
+    match herdr()?.type_line(&pane, &typed_line(dir, run, &nonce)) {
+        Ok(()) => {}
+        // The line may have been typed and only the reply lost. Saying herdr
+        // is not running would be wrong, and a retry would find the tab busy.
+        Err(CallError::NoAnswer) => return Ok(unwatched),
+        Err(error) => return Err(failed(error)),
+    }
 
+    // The line is typed: from here on, herdr trouble only costs the watch.
+    // A read that fails is skipped; only a marker fails the start.
     let until = Instant::now() + timings.watch;
+    let mut watched = false;
     loop {
         pause(
             timings
                 .watch_poll
                 .min(until.saturating_duration_since(Instant::now())),
         );
-        let text = herdr()?.read(&pane, READ_LINES).map_err(failed)?;
-        if let Some((code, printed)) = early_exit(&text, &nonce) {
-            let mut error = format!("{run} exited with {code}");
-            if !printed.is_empty() {
-                error = format!("{error}: {}", printed.join(" / "));
+        let Ok(herdr) = herdr() else {
+            break;
+        };
+        if let Ok(text) = herdr.read(&pane, READ_LINES) {
+            watched = true;
+            if let Some((code, printed)) = early_exit(&text, &nonce) {
+                let mut error = format!("{run} exited with {code}");
+                if !printed.is_empty() {
+                    error = format!("{error}: {}", printed.join(" / "));
+                }
+                return Err(error);
             }
-            return Err(error);
         }
         if Instant::now() >= until {
-            return Ok(format!("herdr tab {label} in {workspace}"));
+            break;
         }
     }
+    Ok(if watched { started } else { unwatched })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -964,6 +979,59 @@ mod tests {
             reads.iter().all(|source| source == "recent_unwrapped"),
             "{reads:?}"
         );
+    }
+
+    /// A reused, idle tab "web" in workspace h2, and a client that gives up
+    /// on an unanswered call after 100 ms.
+    fn reused_tab() -> (FakeHerdr, HerdrClient) {
+        let (fake, mut client) = fake_herdr();
+        let ws = fake.add_workspace(1, "h2");
+        fake.add_tab(&ws, "web");
+        client.timeout = Duration::from_millis(100);
+        (fake, client)
+    }
+
+    const UNWATCHED: &str = "herdr tab web in h2; could not watch it start";
+
+    #[test]
+    fn launch_unanswered_watch_reads_do_not_fail_the_start() {
+        let (fake, client) = reused_tab();
+        fake.withhold("pane.read", usize::MAX);
+        assert_eq!(launch_web(&client), Ok(UNWATCHED.into()));
+        assert_eq!(typed(&fake.requests()).len(), 1);
+    }
+
+    #[test]
+    fn launch_finds_early_exit_after_unanswered_reads() {
+        let (fake, client) = reused_tab();
+        fake.withhold("pane.read", 2);
+        fake.on_type(|line| format!("boom\n[whatsup {}] exited with 1", nonce_of(line)));
+        let timings = HerdrTimings {
+            watch: Duration::from_secs(2),
+            ..quick()
+        };
+        let result = launch(
+            &client,
+            "h2",
+            "web",
+            Path::new("/tmp/a b"),
+            "npm start",
+            &timings,
+            "lucy",
+        );
+        assert_eq!(result, Err("npm start exited with 1: boom".into()));
+        let reads = fake.methods().iter().filter(|m| *m == "pane.read").count();
+        assert_eq!(reads, 3, "two unanswered reads, then the marker");
+    }
+
+    #[test]
+    fn launch_unanswered_send_is_not_a_failure() {
+        // The line may well have been typed: "not running" would be wrong,
+        // and a retry would only find the tab busy.
+        let (fake, client) = reused_tab();
+        fake.withhold("pane.send_input", 1);
+        assert_eq!(launch_web(&client), Ok(UNWATCHED.into()));
+        assert_eq!(typed(&fake.requests()).len(), 1);
     }
 
     #[test]

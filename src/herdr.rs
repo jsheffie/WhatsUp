@@ -146,27 +146,15 @@ impl HerdrClient {
         stream
             .set_write_timeout(Some(left()?))
             .map_err(|_| CallError::NoAnswer)?;
+        // `write_all` retries a write a signal interrupted.
         stream
             .write_all(format!("{request}\n").as_bytes())
             .map_err(|_| CallError::NoAnswer)?;
-        let mut reply = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
+        read_reply(&mut stream, |stream| {
             stream
                 .set_read_timeout(Some(left()?))
-                .map_err(|_| CallError::NoAnswer)?;
-            let read = stream.read(&mut chunk).map_err(|_| CallError::NoAnswer)?;
-            if read == 0 {
-                return Err(CallError::NoAnswer);
-            }
-            reply.extend_from_slice(&chunk[..read]);
-            if let Some(end) = reply.iter().position(|byte| *byte == b'\n') {
-                return call_result(&reply[..end]);
-            }
-            if reply.len() > MAX_REPLY {
-                return Err(CallError::NoAnswer);
-            }
-        }
+                .map_err(|_| CallError::NoAnswer)
+        })
     }
 
     /// Every workspace: id, sidebar number and label.
@@ -314,6 +302,36 @@ fn connect_within(
     match connected_rx.recv_timeout(timeout) {
         Ok(Ok(stream)) => Ok(stream),
         _ => Err(CallError::NoAnswer),
+    }
+}
+
+/// Reads one reply line from `stream`. `before_read` runs before every read;
+/// it bounds the read by what is left of the call's deadline, or fails when
+/// nothing is left.
+fn read_reply<S: Read>(
+    stream: &mut S,
+    mut before_read: impl FnMut(&mut S) -> Result<(), CallError>,
+) -> Result<Value, CallError> {
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        before_read(stream)?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            // A signal arrived (EINTR): read again, within the deadline.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(CallError::NoAnswer),
+        };
+        if read == 0 {
+            return Err(CallError::NoAnswer);
+        }
+        reply.extend_from_slice(&chunk[..read]);
+        if let Some(end) = reply.iter().position(|byte| *byte == b'\n') {
+            return call_result(&reply[..end]);
+        }
+        if reply.len() > MAX_REPLY {
+            return Err(CallError::NoAnswer);
+        }
     }
 }
 
@@ -480,6 +498,8 @@ pub(crate) mod testing {
         on_type: Option<fn(&str) -> String>,
         /// Methods answered with an error: method and message.
         failures: Vec<(String, String)>,
+        /// Methods whose next replies are withheld: method and how many.
+        withheld: Vec<(String, usize)>,
     }
 
     const SHELL_PID: u32 = 100;
@@ -755,6 +775,12 @@ pub(crate) mod testing {
             self.state().failures.push((method.into(), message.into()));
         }
 
+        /// Carries out the next `times` `method` requests but never answers
+        /// them, as if each reply were lost.
+        pub fn withhold(&self, method: &str, times: usize) {
+            self.state().withheld.push((method.into(), times));
+        }
+
         /// Every request so far: method and params.
         pub fn requests(&self) -> Vec<(String, Value)> {
             self.state().requests.clone()
@@ -787,7 +813,18 @@ pub(crate) mod testing {
             let reply = {
                 let mut state = state.lock().unwrap();
                 state.requests.push((method.clone(), params.clone()));
-                match state.answer(&method, &params) {
+                let answer = state.answer(&method, &params);
+                let withheld = state
+                    .withheld
+                    .iter_mut()
+                    .find(|(seen, left)| *seen == method && *left > 0);
+                if let Some((_, left)) = withheld {
+                    // No reply: the client gives up and closes, ending this
+                    // connection.
+                    *left -= 1;
+                    continue;
+                }
+                match answer {
                     Ok(result) => json!({ "id": request["id"], "result": result }),
                     Err(message) => json!({
                         "id": request["id"],
@@ -1083,6 +1120,60 @@ mod tests {
             fake.set_shell(&pane, shell, foreground);
             assert_eq!(herdr.idle(&pane), Ok(false), "{shell:?} {foreground:?}");
         }
+    }
+
+    /// A reader that plays back `steps`: bytes, or an error of that kind.
+    struct Scripted(std::collections::VecDeque<Result<&'static [u8], std::io::ErrorKind>>);
+
+    impl Read for Scripted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(Err(kind)) => Err(kind.into()),
+                None => Ok(0),
+            }
+        }
+    }
+
+    #[test]
+    fn read_reply_retries_an_interrupted_read() {
+        // A signal can interrupt a read (EINTR); std does not retry it.
+        use std::io::ErrorKind::{Interrupted, TimedOut};
+        let mut stream = Scripted(
+            [
+                Ok(&b"{\"id\":\"whatsup\",\"res"[..]),
+                Err(Interrupted),
+                Ok(&b"ult\":{\"type\":\"ok\"}}\n"[..]),
+            ]
+            .into(),
+        );
+        let mut armed = 0;
+        let reply = read_reply(&mut stream, |_| {
+            armed += 1;
+            Ok(())
+        });
+        assert_eq!(reply, Ok(json!({ "type": "ok" })));
+        assert_eq!(armed, 3, "each retry is bounded by the deadline again");
+
+        let mut stream = Scripted([Err(Interrupted), Err(TimedOut)].into());
+        assert_eq!(
+            read_reply(&mut stream, |_| Ok(())),
+            Err(CallError::NoAnswer)
+        );
+        // Once the deadline has passed, an interrupted read is not retried.
+        let mut stream = Scripted([Err(Interrupted), Ok(&b"{}\n"[..])].into());
+        let mut deadline_left = 1;
+        let reply = read_reply(&mut stream, |_| match deadline_left {
+            0 => Err(CallError::NoAnswer),
+            _ => {
+                deadline_left -= 1;
+                Ok(())
+            }
+        });
+        assert_eq!(reply, Err(CallError::NoAnswer));
     }
 
     #[test]
