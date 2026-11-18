@@ -25,6 +25,8 @@ pub const USAGE: &str = concat!(
 const NOT_RUNNING: &str = "WhatsUp is not running; start it first";
 /// How long `start --wait` waits unless `--timeout` says otherwise.
 const DEFAULT_WAIT: Duration = Duration::from_secs(180);
+/// The longest `--timeout` taken: a day.
+const MAX_WAIT_SECS: u64 = 86_400;
 /// Loopback connects at once; this only bounds a wedged listener.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// `list` wraps a row's ports to stay within this many columns.
@@ -150,8 +152,12 @@ fn parse(args: Vec<String>) -> Result<(Command, Option<u16>), String> {
             "--timeout" if name == "start" => {
                 let text = value("a number of seconds")?;
                 let secs = text
-                    .parse()
-                    .map_err(|_| format!("invalid timeout {text}"))?;
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|secs| *secs <= MAX_WAIT_SECS);
+                let secs = secs.ok_or_else(|| {
+                    format!("invalid timeout {text}; give at most {MAX_WAIT_SECS} seconds")
+                })?;
                 timeout = Some(Duration::from_secs(secs));
             }
             flag if flag.starts_with('-') => return Err(format!("{name} has no option {flag}")),
@@ -316,6 +322,7 @@ impl Client<'_> {
                 format!("the dashboard answered with status {status}"),
             )),
             Err(PostError::Connect) => Err(Failure::new(2, NOT_RUNNING)),
+            Err(PostError::Timeout) => Err(Failure::new(1, "the dashboard did not answer in time")),
             Err(PostError::Reply(error)) => Err(Failure::new(
                 1,
                 format!("could not read the dashboard: {error}"),
@@ -356,12 +363,16 @@ impl Client<'_> {
                 )),
             },
             Err(PostError::Connect) => Err(Failure::new(2, NOT_RUNNING)),
-            Err(PostError::Reply(_)) => Err(Failure::new(
+            Err(PostError::Timeout) => Err(Failure::new(
                 1,
                 format!(
                     "WhatsUp did not answer in time; it may still be {}",
                     act.doing()
                 ),
+            )),
+            Err(PostError::Reply(error)) => Err(Failure::new(
+                1,
+                format!("WhatsUp did not reply to the {}: {error}", act.verb()),
             )),
         }
     }
@@ -484,7 +495,7 @@ fn resolve(dashboard: &Value, row: &str, machine: Option<&str>) -> Result<Target
         id.is_some_and(|id| id.eq_ignore_ascii_case(row))
             || row_key(group, candidate).eq_ignore_ascii_case(row)
     };
-    let mut elsewhere = None;
+    let mut elsewhere = false;
     for group in items(dashboard, "groups") {
         for candidate in items(group, "rows").filter(|candidate| named(group, candidate)) {
             let Some(index) = candidate["index"].as_u64() else {
@@ -499,11 +510,11 @@ fn resolve(dashboard: &Value, row: &str, machine: Option<&str>) -> Result<Target
                     name: row_name(group, candidate),
                 });
             }
-            elsewhere.get_or_insert_with(|| row_name(group, candidate));
+            elsewhere = true;
         }
     }
-    if let Some(name) = elsewhere {
-        return Err(format!("{name} is not on {machine}"));
+    if elsewhere {
+        return Err(format!("{row} is not on {machine}"));
     }
     let known: Vec<String> = rows_on(dashboard, machine)
         .map(|(group, row)| row_id(group, row))
@@ -857,11 +868,17 @@ mod tests {
             &["start", "jds", "--port", "0"],
             &["start", "jds", "--port", "http"],
             &["start", "jds", "--timeout", "soon"],
+            &["start", "jds", "--timeout", "86401"],
+            &["start", "jds", "--timeout", "18446744073709551615"],
             &["stop", "jds", "--machine"],
         ] {
             assert!(parse(strings(bad)).is_err(), "{bad:?}");
         }
         assert!(parse(strings(&["start"])).unwrap_err().contains("row"));
+        assert!(matches!(
+            parse(strings(&["start", "jds", "--timeout", "86400"])),
+            Ok((Command::Start { timeout, .. }, None)) if timeout == Duration::from_secs(86400)
+        ));
         assert!(parse(strings(&["list", "--bogus"]))
             .unwrap_err()
             .contains("--bogus"));
@@ -920,6 +937,11 @@ mod tests {
         assert_eq!(
             resolve(&board, "jds2", Some("lucy")),
             Err("jds2 is not on lucy".to_string())
+        );
+        // As typed, not by the row's title.
+        assert_eq!(
+            resolve(&board, "personal/0", Some("lucy")),
+            Err("personal/0 is not on lucy".to_string())
         );
         assert_eq!(
             resolve(&board, "jds9", None),
@@ -1015,11 +1037,17 @@ jeeves 0/0 up (offline)
 
     /// A WhatsUp stand-in on an ephemeral port that serves canned replies by
     /// path. Each path's replies are given in turn and the last one repeats;
-    /// other paths get an empty 404, as axum gives.
+    /// other paths get an empty 404, as axum gives. The statuses `CLOSE` and
+    /// `SILENT` stand for no reply at all.
     struct Fake {
         port: u16,
         seen: Arc<Mutex<Vec<String>>>,
     }
+
+    /// Close the connection without a reply, as a handler that panicked.
+    const CLOSE: u16 = 0;
+    /// Say nothing for a second, then close.
+    const SILENT: u16 = 1;
 
     const FAST: Settings = Settings {
         dashboard_read: Duration::from_secs(2),
@@ -1050,6 +1078,14 @@ jeeves 0/0 up (offline)
                         Some(replies) => replies[0].clone(),
                         None => (404, Value::Null),
                     };
+                    match status {
+                        CLOSE => continue,
+                        SILENT => {
+                            thread::sleep(Duration::from_secs(1));
+                            continue;
+                        }
+                        _ => {}
+                    }
                     let body = if body.is_null() {
                         String::new()
                     } else {
@@ -1066,13 +1102,17 @@ jeeves 0/0 up (offline)
         }
 
         fn run(&self, args: &[&str]) -> (u8, String, String) {
+            self.run_with(&FAST, args)
+        }
+
+        fn run_with(&self, settings: &Settings, args: &[&str]) -> (u8, String, String) {
             // Always a --port: never the instance file, never the real WhatsUp.
             let mut args = strings(args);
             if !args.iter().any(|arg| arg == "--port") {
                 args.extend(["--port".to_string(), self.port.to_string()]);
             }
             let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = run_with(args, &FAST, &mut out, &mut err);
+            let code = run_with(args, settings, &mut out, &mut err);
             (
                 code,
                 String::from_utf8(out).unwrap(),
@@ -1245,6 +1285,35 @@ jeeves 0/0 up (offline)
             "{err}"
         );
         assert_eq!(fake.count("/api/start") + fake.count("/api/stop"), 0);
+    }
+
+    #[test]
+    fn a_start_without_a_reply_says_why() {
+        let closed = Fake::serve(vec![
+            ("/api/dashboard", vec![(200, dashboard(false))]),
+            ("/api/start", vec![(CLOSE, Value::Null)]),
+        ]);
+        let (code, out, err) = closed.run(&["start", "jds2"]);
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert_eq!(
+            err,
+            "whatsup: WhatsUp did not reply to the start: the connection closed without a reply\n"
+        );
+
+        let silent = Fake::serve(vec![
+            ("/api/dashboard", vec![(200, dashboard(false))]),
+            ("/api/stop", vec![(SILENT, Value::Null)]),
+        ]);
+        let quick = Settings {
+            action_read: Duration::from_millis(200),
+            ..FAST
+        };
+        let (code, out, err) = silent.run_with(&quick, &["stop", "jds2"]);
+        assert_eq!((code, out.as_str()), (1, ""));
+        assert_eq!(
+            err,
+            "whatsup: WhatsUp did not answer in time; it may still be stopping\n"
+        );
     }
 
     fn started_jds2() -> Value {

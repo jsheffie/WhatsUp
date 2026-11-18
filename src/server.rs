@@ -745,7 +745,7 @@ async fn forward(act: Act, remote: &Remote, body: String, timeout: Duration) -> 
             StatusCode::BAD_GATEWAY,
             format!("WhatsUp is not running on {name}"),
         ),
-        Err(PostError::Reply(_)) => error_response(
+        Err(PostError::Timeout | PostError::Reply(_)) => error_response(
             StatusCode::BAD_GATEWAY,
             format!(
                 "{name} did not answer in time; it may still be {}",

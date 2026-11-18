@@ -2,7 +2,7 @@
 //! command line talking to this machine's WhatsUp, and a forwarded start or
 //! stop reaching a remote one through the SSH SOCKS tunnel.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -12,7 +12,11 @@ pub enum PostError {
     /// Nothing accepted the connection: the tunnel is down, or nothing
     /// listens on the port.
     Connect,
-    /// Connected, but no complete HTTP reply came back.
+    /// Connected, but no reply came back within the read timeout.
+    Timeout,
+    /// Connected, but the reply failed for another reason: the connection
+    /// closed or reset, the request could not be sent, or the reply is not
+    /// HTTP.
     Reply(String),
 }
 
@@ -47,7 +51,15 @@ pub fn exchange(
     let mut response = Vec::new();
     stream
         .read_to_end(&mut response)
-        .map_err(|err| PostError::Reply(format!("no reply: {err}")))?;
+        .map_err(|err| match err.kind() {
+            ErrorKind::WouldBlock | ErrorKind::TimedOut => PostError::Timeout,
+            _ => PostError::Reply(format!("no reply: {err}")),
+        })?;
+    if response.is_empty() {
+        return Err(PostError::Reply(
+            "the connection closed without a reply".into(),
+        ));
+    }
     let response = String::from_utf8_lossy(&response);
     let not_http = || PostError::Reply("the reply is not http".into());
     let (head, body) = response.split_once("\r\n\r\n").ok_or_else(not_http)?;
@@ -71,6 +83,11 @@ mod tests {
     /// Reads one request head (a GET has no body), answers it with `reply`
     /// as raw bytes, and hands back what it read.
     fn one_reply(reply: &'static str) -> (u16, mpsc::Receiver<String>) {
+        held_reply(reply, Duration::ZERO)
+    }
+
+    /// As [`one_reply`], but holds the connection silent for `hold` first.
+    fn held_reply(reply: &'static str, hold: Duration) -> (u16, mpsc::Receiver<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (tx, rx) = mpsc::channel();
@@ -86,6 +103,7 @@ mod tests {
                 }
             }
             let _ = tx.send(String::from_utf8_lossy(&seen).to_string());
+            thread::sleep(hold);
             let _ = stream.write_all(reply.as_bytes());
         });
         (port, rx)
@@ -114,5 +132,25 @@ mod tests {
         let (port, _seen) = one_reply("SSH-2.0-OpenSSH_9.6\r\n");
         let reply = exchange(connect(port), "GET", port, "/api/dashboard", None, QUICK);
         assert_eq!(reply, Err(PostError::Reply("the reply is not http".into())));
+    }
+
+    #[test]
+    fn a_closed_connection_is_not_a_timeout() {
+        let (port, _seen) = one_reply("");
+        let reply = exchange(connect(port), "GET", port, "/api/dashboard", None, QUICK);
+        assert_eq!(
+            reply,
+            Err(PostError::Reply(
+                "the connection closed without a reply".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_silent_server_times_out() {
+        let (port, _seen) = held_reply("", Duration::from_secs(1));
+        let quick = Duration::from_millis(200);
+        let reply = exchange(connect(port), "GET", port, "/api/dashboard", None, quick);
+        assert_eq!(reply, Err(PostError::Timeout));
     }
 }
