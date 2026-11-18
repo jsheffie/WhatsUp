@@ -448,11 +448,14 @@ async fn stop_row(State(state): State<AppState>, headers: HeaderMap, body: Strin
         None => return bad(format!("unknown machine {wanted}")),
     };
 
+    // A group or row the page saw and this config lacks: the config changed
+    // since the page was painted (or, forwarded, differs between machines).
+    let changed = || error_response(StatusCode::CONFLICT, CONFIG_CHANGED);
     let Some(group) = config.groups.iter().find(|group| group.id == request.group) else {
-        return bad(format!("unknown group {}", request.group));
+        return changed();
     };
     let Some(row) = group.rows.get(request.row) else {
-        return bad(format!("group {} has no row {}", group.id, request.row));
+        return changed();
     };
     let ports = row.ports();
     if ports.is_empty() {
@@ -460,7 +463,7 @@ async fn stop_row(State(state): State<AppState>, headers: HeaderMap, body: Strin
     }
     let seen: BTreeSet<u16> = request.ports.iter().copied().collect();
     if !row.shown_on(&machine) || !seen.into_iter().eq(ports.iter().copied()) {
-        return error_response(StatusCode::CONFLICT, CONFIG_CHANGED);
+        return changed();
     }
 
     if let Some(remote) = remote {
@@ -1182,9 +1185,14 @@ mod tests {
                 "the dashboard config changed; reload and try again"
             );
         }
-        // A row that is no longer on this machine has changed too.
-        let moved = r#"{"group":"g","row":2,"ports":[3007]}"#;
-        assert_eq!(stop(addr, moved, &[]).await.0, 409);
+        // So has a row that is no longer on this machine, or gone.
+        for body in [
+            r#"{"group":"g","row":2,"ports":[3007]}"#,
+            r#"{"group":"g","row":9,"ports":[3004,8004]}"#,
+            r#"{"group":"nope","row":1,"ports":[3004,8004]}"#,
+        ] {
+            assert_eq!(stop(addr, body, &[]).await.0, 409, "{body}");
+        }
         assert!(stopper.calls().is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1194,8 +1202,6 @@ mod tests {
         let stopper = Arc::new(RecordingStopper::default());
         let (addr, dir) = serve_stop("bad", stopper.clone()).await;
         for body in [
-            r#"{"group":"nope","row":1,"ports":[3004,8004]}"#,
-            r#"{"group":"g","row":9,"ports":[3004,8004]}"#,
             r#"{"group":"g","row":0,"ports":[]}"#,
             r#"{"machine":"lucy","group":"g","row":2,"ports":[3007]}"#,
             r#"{"group":"g","row":"one","ports":[3004,8004]}"#,

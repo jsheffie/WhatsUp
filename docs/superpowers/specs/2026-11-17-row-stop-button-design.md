@@ -152,9 +152,10 @@ is not found, step 1 finds nothing.
   before any per-machine filtering). `/api/dashboard` adds `"index"` and
   `"ports"` (distinct, ascending) to every row it sends.
 - The server reloads the config, finds the row, and checks that it is shown
-  on `machine` and that its distinct ports equal `ports`. Otherwise
+  on `machine` and that its distinct ports equal `ports`. Otherwise, and
+  when the group or the row index does not exist,
   `409 { "error": "the dashboard config changed; reload and try again" }`.
-  Unknown group, row out of range, row with no links: `400`.
+  Unknown machine, a row with no links, a body that is not a request: `400`.
 - A row already being stopped by this server: `409 { "error": "already
   stopping" }`.
 - Guard against other sites: the `Host` header's host must be `127.0.0.1`,
