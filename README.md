@@ -103,9 +103,9 @@ Every row with links has a Start button beside Stop. It starts whatever of the r
 - A port published by docker: `docker compose -p <project> start` for the compose project of the container that publishes it, or `docker start` for a container outside compose. It uses the existing, stopped containers (they keep their port bindings), so it needs no config. Containers are never created.
 - A link with a `start` in the config: the command runs in a herdr tab named after the link, in the row's herdr workspace (the first one matching the row's `herdr` prefix, created if none matches). A tab with that name is reused when its shell is idle, and refused ("busy; it may still be starting") when it is not; otherwise a tab is created. WhatsUp types this one line into the tab's interactive shell, so aliases like `tt2a` work and the logs stay in the tab:
   `cd -- '<dir>' && { <run>; }; echo "[whatsup <nonce>] exited with $?"`
-- When the command ends within 5 seconds, Start reports its exit code and the last lines of output instead of success. If herdr stops answering after the command was typed, Start still reports the port as started, with "could not watch it start".
+- When the command fails (a nonzero exit code) within 5 seconds, Start reports the code and the last lines of output instead of success. Exiting 0 within those 5 seconds counts as started ("<run> finished"); the ports then say whether the row came up. If herdr stops answering after the command was typed, Start still reports the port as started, with "could not watch it start".
 - A port with no `start` and no container publishing it fails with "no start command, and no container publishes it". Several containers publishing it fails with "several containers publish it: <names>".
-- The button reads Starting... until every port it started is up, or for 3 minutes, after which the banner names what is still down.
+- The button reads Starting... until every port it started is up, or for 3 minutes, after which the banner names what is still down and where to look: its herdr tab, or docker.
 
 Rows of a remote machine are started by the WhatsUp running on that machine (same tunnel and requirements as Stop). A request names a row, never a command: each WhatsUp runs only commands from its own config.
 
@@ -118,7 +118,7 @@ Rows of a remote machine are started by the WhatsUp running on that machine (sam
 ] }
 ```
 
-- `start.dir` is absolute or starts with `~/` (the home of the machine that runs it). `start.run` is one line of shell text.
+- `start.dir` is absolute or starts with `~/` (the home of the machine that runs it). `start.run` is one line of shell text, without tabs or other control characters, that does not end with `;`, `&` or `|` (typed inside `{ <run>; }`, those would run nothing).
 - `id` on a row is its name for the [command line](#command-line): 1 to 32 characters of `A-Za-z0-9_-`, unique across all rows (case ignored).
 - The config is rejected when a row has a `start` but no herdr cell (the workspace has no name), when two links of a row on the same port both have a `start`, or when an `id`, `dir` or `run` is invalid.
 - A row is either starting or stopping, never both.

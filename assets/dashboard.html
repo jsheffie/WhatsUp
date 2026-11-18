@@ -414,7 +414,7 @@
     // After a start reply, the ports it started, until they are all up or
     // STARTING_MS passes. This alone keeps Start at "Starting...", so it can
     // sit beside an armed Stop.
-    const startWatch = new Map(); // -> { ports: number[], timer }
+    const startWatch = new Map(); // -> { ports: { port, action }[], timer }
     const STARTING_MS = 3 * 60 * 1000;
     let lastData = null;
     upOnlyEl.checked = localStorage.getItem("whatsup-up-only") === "1";
@@ -831,7 +831,7 @@
       if (!data) return;
       startWatch.forEach((watch, key) => {
         const found = findRow(data, key);
-        if (!found || watch.ports.every((port) => portUp(found.row, port))) endWatch(key);
+        if (!found || watch.ports.every(({ port }) => portUp(found.row, port))) endWatch(key);
       });
     }
 
@@ -840,13 +840,17 @@
       endWatch(key);
       const found = lastData && findRow(lastData, key);
       if (!watch || !found) return;
-      const waiting = watch.ports.filter((port) => !portUp(found.row, port)).map((port) => {
+      const down = watch.ports.filter(({ port }) => !portUp(found.row, port));
+      if (!down.length) return;
+      const waiting = down.map(({ port }) => {
         const link = linksOf(found.row).find((cell) => cell.port === port);
         return (link ? link.label : "port") + " (" + port + ")";
       });
-      if (waiting.length) {
-        notice("action", rowName(found.group, found.row) + ": still waiting for " + waiting.join(", ") + "...; see its herdr tab");
-      }
+      // Point at where a stuck start shows why: its herdr tab, or docker.
+      const hints = [];
+      if (down.some(({ action }) => action === "herdr")) hints.push("see its herdr tab");
+      if (down.some(({ action }) => action !== "herdr")) hints.push("check docker");
+      notice("action", rowName(found.group, found.row) + ": still waiting for " + waiting.join(", ") + "...; " + hints.join(" and "));
     }
 
     async function startClicked(key, request) {
@@ -864,7 +868,7 @@
         // A failed reply may still have started some ports: watch those too.
         started = (payload.results || [])
           .filter((result) => result.action !== "none" && !result.error)
-          .map((result) => result.port);
+          .map((result) => ({ port: result.port, action: result.action }));
       } catch (err) {
         notice("action", "Start failed: could not reach WhatsUp");
       }

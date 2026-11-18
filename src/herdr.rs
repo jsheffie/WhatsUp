@@ -123,8 +123,11 @@ pub struct HerdrClient {
 /// Why a herdr call failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallError {
-    /// No herdr answered: no socket, refused, too slow, closed early, or a
-    /// reply that is not herdr's.
+    /// No connection: no socket, refused, or the connect timed out. Nothing
+    /// was sent.
+    NoConnection,
+    /// Connected, but no herdr answered: too slow, closed early, or a reply
+    /// that is not herdr's. The request may have been carried out.
     NoAnswer,
     /// herdr answered with an error, or without what the call asks for.
     Failed(String),
@@ -301,7 +304,7 @@ fn connect_within(
     });
     match connected_rx.recv_timeout(timeout) {
         Ok(Ok(stream)) => Ok(stream),
-        _ => Err(CallError::NoAnswer),
+        _ => Err(CallError::NoConnection),
     }
 }
 
@@ -412,7 +415,7 @@ pub(crate) mod testing {
     }
 
     /// A herdr that stopped accepting, with its accept queue full: a
-    /// blocking connect to it waits forever on Linux (macOS refuses at once).
+    /// blocking connect to it waits forever on Linux (macOS does not block).
     pub fn stuck_herdr(path: &Path) -> UnixListener {
         let listener = tiny_backlog_listener(path);
         for _ in 0..4 {
@@ -500,6 +503,9 @@ pub(crate) mod testing {
         failures: Vec<(String, String)>,
         /// Methods whose next replies are withheld: method and how many.
         withheld: Vec<(String, usize)>,
+        /// The method after whose first reply the socket file is removed,
+        /// and that file.
+        vanish: Option<(String, PathBuf)>,
     }
 
     const SHELL_PID: u32 = 100;
@@ -781,6 +787,12 @@ pub(crate) mod testing {
             self.state().withheld.push((method.into(), times));
         }
 
+        /// Removes the socket file once the next `method` request is
+        /// answered, so later connects fail as if herdr had quit.
+        pub fn vanish_after(&self, method: &str) {
+            self.state().vanish = Some((method.into(), self.path.clone()));
+        }
+
         /// Every request so far: method and params.
         pub fn requests(&self) -> Vec<(String, Value)> {
             self.state().requests.clone()
@@ -823,6 +835,9 @@ pub(crate) mod testing {
                     // connection.
                     *left -= 1;
                     continue;
+                }
+                if let Some((_, path)) = state.vanish.take_if(|(seen, _)| *seen == method) {
+                    let _ = std::fs::remove_file(path);
                 }
                 match answer {
                     Ok(result) => json!({ "id": request["id"], "result": result }),
@@ -1048,10 +1063,11 @@ mod tests {
     }
 
     #[test]
-    fn call_without_an_answer_is_no_answer() {
+    fn call_without_a_connection_or_an_answer() {
+        // No socket: nothing was sent.
         assert_eq!(
             client(&socket_path(), QUERY_BUDGET).call("workspace.list", json!({})),
-            Err(CallError::NoAnswer)
+            Err(CallError::NoConnection)
         );
         let closed = fake_herdr(drop);
         assert_eq!(
@@ -1097,7 +1113,13 @@ mod tests {
         let result = done_rx
             .recv_timeout(Duration::from_secs(3))
             .expect("call hung on a full accept queue");
-        assert_eq!(result, Err(CallError::NoAnswer));
+        // Whether the connect itself times out (Linux) or gets through and
+        // the reply never comes depends on the platform; either way the call
+        // ends within its timeout.
+        assert!(
+            matches!(result, Err(CallError::NoConnection | CallError::NoAnswer)),
+            "{result:?}"
+        );
         assert!(started.elapsed() < Duration::from_millis(600));
         drop(listener);
         let _ = std::fs::remove_file(path);

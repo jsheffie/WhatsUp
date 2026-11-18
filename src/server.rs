@@ -383,7 +383,7 @@ impl Act {
     }
 }
 
-const CONFIG_CHANGED: &str = "the dashboard config changed; reload and try again";
+pub(crate) const CONFIG_CHANGED: &str = "the dashboard config changed; reload and try again";
 
 /// How long a forwarded stop may take: the remote's own worst case (the
 /// docker listing, a docker stop, a kill) and some room.
@@ -745,12 +745,16 @@ async fn forward(act: Act, remote: &Remote, body: String, timeout: Duration) -> 
             StatusCode::BAD_GATEWAY,
             format!("WhatsUp is not running on {name}"),
         ),
-        Err(PostError::Timeout | PostError::Reply(_)) => error_response(
+        Err(PostError::Timeout) => error_response(
             StatusCode::BAD_GATEWAY,
             format!(
                 "{name} did not answer in time; it may still be {}",
                 act.doing()
             ),
+        ),
+        Err(PostError::Reply(reason)) => error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("{name} did not reply to the {}: {reason}", act.verb()),
         ),
     }
 }
@@ -2203,6 +2207,25 @@ mod tests {
             "lucy did not answer in time; it may still be starting"
         );
         assert!(started.elapsed() < Duration::from_secs(3));
+
+        // Connected and closed without a reply, or answered with something
+        // that is not HTTP: not a timeout, so say what happened.
+        for (name, reply, reason) in [
+            (
+                "start-fwd-closed",
+                "",
+                "the connection closed without a reply",
+            ),
+            ("start-fwd-garbage", "hello\r\n", "the reply is not http"),
+        ] {
+            let (status, json) = forward_through(name, "/api/start", Some(reply)).await;
+            assert_eq!(status, 502, "{name}");
+            assert_eq!(
+                json["error"],
+                format!("lucy did not reply to the start: {reason}"),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

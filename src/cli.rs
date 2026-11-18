@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 
 use crate::http::{exchange, PostError};
 use crate::instance;
+use crate::server::CONFIG_CHANGED;
 
 /// The command line forms, as `whatsup --help` and usage errors show them.
 pub const USAGE: &str = concat!(
@@ -435,11 +436,16 @@ fn report(reply: &Reply, json: bool, out: &mut dyn Write) -> Result<(), Failure>
         write!(out, "{}", format_results(&reply.value))
     };
     if reply.ok {
-        Ok(())
-    } else {
-        let error = reply.value["error"].as_str();
-        Err(Failure::new(1, error.unwrap_or("the request failed")))
+        return Ok(());
     }
+    let error = match reply.value["error"].as_str() {
+        // The dashboard's wording asks for a page reload; a command reads
+        // the config afresh, so running it again is enough.
+        Some(CONFIG_CHANGED) => "the config changed; try again",
+        Some(error) => error,
+        None => "the request failed",
+    };
+    Err(Failure::new(1, error))
 }
 
 /// One line per port: the port, what was done (or `error`), and how.
@@ -1259,6 +1265,27 @@ jeeves 0/0 up (offline)
         let (code, out, err) = busy.run(&["start", "jds2"]);
         assert_eq!((code, out.as_str()), (1, ""));
         assert_eq!(err, "whatsup: already stopping\n");
+    }
+
+    #[test]
+    fn a_changed_config_says_to_try_again() {
+        // The dashboard's wording asks for a page reload; the command line
+        // reads the config afresh on every run.
+        let changed = json!({ "error": CONFIG_CHANGED });
+        let fake = Fake::serve(vec![
+            ("/api/dashboard", vec![(200, dashboard(false))]),
+            ("/api/start", vec![(409, changed.clone())]),
+            ("/api/stop", vec![(409, changed.clone())]),
+        ]);
+        for act in ["start", "stop"] {
+            let (code, out, err) = fake.run(&[act, "jds2"]);
+            assert_eq!((code, out.as_str()), (1, ""), "{act}");
+            assert_eq!(err, "whatsup: the config changed; try again\n", "{act}");
+        }
+        let (code, out, err) = fake.run(&["start", "jds2", "--json"]);
+        assert_eq!(code, 1);
+        assert_eq!(serde_json::from_str::<Value>(&out).unwrap(), changed);
+        assert_eq!(err, "whatsup: the config changed; try again\n");
     }
 
     #[test]

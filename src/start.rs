@@ -77,8 +77,9 @@ fn not_running(machine: &str) -> String {
 
 /// Types `run` into the herdr tab `label` of the first workspace matching
 /// `prefix`, creating the workspace or tab when missing, and watches it for
-/// an early exit. The detail on success names the tab and workspace. All of
-/// it fits in `timings.link_budget`.
+/// an early exit: a nonzero one fails the start, exit 0 is a start. The
+/// detail on success names the tab and workspace. All of it fits in
+/// `timings.link_budget`.
 pub fn launch(
     client: &HerdrClient,
     prefix: &str,
@@ -99,7 +100,7 @@ pub fn launch(
         }),
     };
     let failed = |error: CallError| match error {
-        CallError::NoAnswer => not_running(machine),
+        CallError::NoConnection | CallError::NoAnswer => not_running(machine),
         CallError::Failed(message) => format!("herdr: {message}"),
     };
     let pause = |wait: Duration| std::thread::sleep(wait.min(left()));
@@ -168,14 +169,16 @@ pub fn launch(
     let nonce = nonce();
     match herdr()?.type_line(&pane, &typed_line(dir, run, &nonce)) {
         Ok(()) => {}
-        // The line may have been typed and only the reply lost. Saying herdr
-        // is not running would be wrong, and a retry would find the tab busy.
+        // Connected, then no reply: the line may have been typed and only the
+        // reply lost. Saying herdr is not running would be wrong, and a retry
+        // would find the tab busy. A failed connect sent nothing, so that one
+        // fails like any other call.
         Err(CallError::NoAnswer) => return Ok(unwatched),
         Err(error) => return Err(failed(error)),
     }
 
     // The line is typed: from here on, herdr trouble only costs the watch.
-    // A read that fails is skipped; only a marker fails the start.
+    // A read that fails is skipped; only a nonzero exit fails the start.
     let until = Instant::now() + timings.watch;
     let mut watched = false;
     loop {
@@ -190,6 +193,10 @@ pub fn launch(
         if let Ok(text) = herdr.read(&pane, READ_LINES) {
             watched = true;
             if let Some((code, printed)) = early_exit(&text, &nonce) {
+                // Exiting 0 did what was asked; the ports say if it is up.
+                if code == 0 {
+                    return Ok(format!("{started}; {run} finished"));
+                }
                 let mut error = format!("{run} exited with {code}");
                 if !printed.is_empty() {
                     error = format!("{error}: {}", printed.join(" / "));
@@ -941,6 +948,19 @@ mod tests {
     }
 
     #[test]
+    fn launch_exit_0_within_the_watch_is_a_start() {
+        // A command that finishes at once (a daemonizing script, say) did
+        // what it was asked; the ports decide whether the row is up.
+        let (fake, client) = fake_herdr();
+        fake.on_type(|line| format!("started\n[whatsup {}] exited with 0", nonce_of(line)));
+        assert_eq!(
+            launch_web(&client),
+            Ok("herdr tab web in h2; npm start finished".into())
+        );
+        assert_eq!(typed(&fake.requests()).len(), 1);
+    }
+
+    #[test]
     fn launch_ignores_stale_marker() {
         let (fake, client) = fake_herdr();
         let ws = fake.add_workspace(1, "h2");
@@ -1032,6 +1052,20 @@ mod tests {
         fake.withhold("pane.send_input", 1);
         assert_eq!(launch_web(&client), Ok(UNWATCHED.into()));
         assert_eq!(typed(&fake.requests()).len(), 1);
+    }
+
+    #[test]
+    fn launch_fails_when_herdr_goes_away_before_typing() {
+        // A connect that fails sent nothing: herdr is not running, and
+        // nothing may claim the line was typed.
+        let (fake, client) = reused_tab();
+        fake.vanish_after("pane.process_info");
+        assert_eq!(
+            launch_web(&client),
+            Err("herdr is not running on lucy".into())
+        );
+        assert_eq!(typed(&fake.requests()), Vec::<Value>::new());
+        assert_eq!(fake.methods().last().unwrap(), "pane.process_info");
     }
 
     #[test]

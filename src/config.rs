@@ -78,14 +78,6 @@ impl Row {
         })
     }
 
-    /// The row's id, else `<group>/<index>`.
-    pub fn name(&self, group_id: &str, index: usize) -> String {
-        match &self.id {
-            Some(id) => id.clone(),
-            None => format!("{group_id}/{index}"),
-        }
-    }
-
     pub fn shown_on(&self, machine: &str) -> bool {
         self.machines.as_ref().is_none_or(|machines| {
             machines
@@ -475,17 +467,20 @@ impl RawConfig {
         }
         let refresh_ms = self.refresh_ms.clamp(500, 60_000);
         let mut seen_ids = BTreeSet::new();
-        let mut seen_row_ids = BTreeSet::new();
+        // Each row id seen, case ignored: where it is, as `<group>/<index>`.
+        let mut seen_row_ids = BTreeMap::new();
         let mut groups = Vec::with_capacity(self.groups.len());
         for group in self.groups {
             if !seen_ids.insert(group.id.clone()) {
                 return Err(format!("duplicate group id {}", group.id));
             }
             let group = group.into_group()?;
-            for row in &group.rows {
+            for (index, row) in group.rows.iter().enumerate() {
                 if let Some(id) = &row.id {
-                    if !seen_row_ids.insert(id.to_ascii_lowercase()) {
-                        return Err(format!("duplicate row id {id}"));
+                    let place = format!("{}/{index}", group.id);
+                    if let Some(first) = seen_row_ids.insert(id.to_ascii_lowercase(), place.clone())
+                    {
+                        return Err(format!("duplicate row id {id}: {first} and {place}"));
                     }
                 }
             }
@@ -680,8 +675,17 @@ fn parse_start(map: &serde_json::Map<String, Value>, at: &str) -> Result<StartCo
     if dir.chars().any(|ch| ch.is_control()) {
         return Err(format!("{at} start dir has a control character"));
     }
+    // `run` is typed into a shell as `{ <run>; }`: a line break or another
+    // control character (a tab completes, ^C drops the line) and a trailing
+    // `;`, `&` or `|` (a parse error there) would run nothing, silently.
     if run.chars().any(|ch| ch == '\n' || ch == '\r') {
         return Err(format!("{at} start run must be one line"));
+    }
+    if run.chars().any(|ch| ch.is_control()) {
+        return Err(format!("{at} start run has a control character"));
+    }
+    if run.trim_end().ends_with([';', '&', '|']) {
+        return Err(format!("{at} start run must not end with ;, & or |"));
     }
     Ok(StartCommand { dir, run })
 }
@@ -1184,8 +1188,6 @@ mod tests {
             })
         );
         assert_eq!(rows[1].id.as_deref(), Some("jds2"));
-        assert_eq!(rows[1].name("pipelinecore", 1), "jds2");
-        assert_eq!(rows[0].name("pipelinecore", 0), "pipelinecore/0");
         assert_eq!(rows[1].herdr_prefix(), Some("h2"));
         assert_eq!(rows[0].herdr_prefix(), None);
     }
@@ -1215,6 +1217,49 @@ mod tests {
             assert!(
                 error.contains("group pipelinecore row 0 column 1"),
                 "{start}: {error}"
+            );
+        }
+    }
+
+    /// The error for a link whose start is `start`.
+    fn start_error(start: &str) -> String {
+        parse_config(&start_row(HERDR, start)).expect_err(start)
+    }
+
+    #[test]
+    fn start_rejects_run_that_cannot_end_a_line() {
+        // `{ <run>; }` is a parse error for these, so the marker never prints.
+        for run in ["a;", "a &", "a && ", "a |", "a ||", "cd x;;"] {
+            let start = format!(r#", "start": {{ "dir": "~/x", "run": "{run}" }}"#);
+            assert_eq!(
+                start_error(&start),
+                "group pipelinecore row 0 column 1 start run must not end with ;, & or |",
+                "{run}"
+            );
+        }
+        for run in ["a && b", "a | b", "a; b", "echo '&'x"] {
+            let start = format!(r#", "start": {{ "dir": "~/x", "run": "{run}" }}"#);
+            assert!(parse_config(&start_row(HERDR, &start)).is_ok(), "{run}");
+        }
+    }
+
+    #[test]
+    fn start_rejects_control_characters() {
+        // A tab triggers completion and ^C drops the line: nothing runs.
+        for run in [r"a\tb", r"npm start\u0003", r"a\u001b[A", r"a\u007f"] {
+            let start = format!(r#", "start": {{ "dir": "~/x", "run": "{run}" }}"#);
+            assert_eq!(
+                start_error(&start),
+                "group pipelinecore row 0 column 1 start run has a control character",
+                "{run}"
+            );
+        }
+        for dir in [r"~/a\tb", r"/srv/a\u0003"] {
+            let start = format!(r#", "start": {{ "dir": "{dir}", "run": "a" }}"#);
+            assert_eq!(
+                start_error(&start),
+                "group pipelinecore row 0 column 1 start dir has a control character",
+                "{dir}"
             );
         }
     }
@@ -1249,7 +1294,16 @@ mod tests {
             { "id": "b", "label": "B", "columns": ["A"], "rows": [{ "id": "JDS2", "cells": ["x"] }] }
         ] }"#;
         let error = parse_config(two_groups).unwrap_err();
-        assert!(error.contains("duplicate row id"), "{error}");
+        assert_eq!(error, "duplicate row id JDS2: a/0 and b/0");
+        let one_group = r#"{ "groups": [
+            { "id": "g", "label": "G", "columns": ["A"], "rows": [
+                { "cells": ["x"] },
+                { "id": "jds2", "cells": ["x"] },
+                { "id": "jds2", "cells": ["x"] }
+            ] }
+        ] }"#;
+        let error = parse_config(one_group).unwrap_err();
+        assert_eq!(error, "duplicate row id jds2: g/1 and g/2");
     }
 
     #[test]
