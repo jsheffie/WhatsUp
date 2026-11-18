@@ -128,7 +128,17 @@ pub(crate) fn run_docker(
     args: &[&str],
     timeout: Duration,
 ) -> Result<String, String> {
-    let shown = format!("docker {}", args.join(" "));
+    run_docker_as(docker, args, timeout, &format!("docker {}", args.join(" ")))
+}
+
+/// Runs docker with `args`; the error is `shown`, then its last line of
+/// stderr.
+pub(crate) fn run_docker_as(
+    docker: &Path,
+    args: &[&str],
+    timeout: Duration,
+    shown: &str,
+) -> Result<String, String> {
     let mut command = Command::new(docker);
     command
         .args(args)
