@@ -53,7 +53,9 @@ Tip: keep your real config in a private dotfiles repo and symlink it to the user
 
 ## Config format
 
-See [`config/whatsup.json`](config/whatsup.json) for a working example. Each link is `{ "label", "url", "port"? }`; when `port` is omitted it is derived from the URL. `null` leaves a cell empty. `tone` (`gray` / `black`) alternates row shading.
+See [`config/whatsup.json`](config/whatsup.json) for a working example. Each link is `{ "label", "url", "port"? }`; when `port` is omitted it is derived from the URL. `null` leaves a cell empty. `tone` (`gray` / `black`) alternates row shading. A link shows as `label:port`, so a short label such as `admin` reads `admin:8003`.
+
+A group can list `"hidden_columns": ["Swagger"]`: those columns start hidden. The Columns menu on the dashboard shows or hides any column; each browser remembers its choices per group, and "Reset to defaults" goes back to the config.
 
 ## Remote machines
 
@@ -101,7 +103,7 @@ Rows of a remote machine are stopped by the WhatsUp running on that machine: the
 Every row with links has a Start button beside Stop. It starts whatever of the row is not running, with one click. Ports that are already up are left alone, and only ports whose links point at the machine itself are started.
 
 - A port published by docker: `docker compose -p <project> start` for the compose project of the container that publishes it, or `docker start` for a container outside compose. It uses the existing, stopped containers (they keep their port bindings), so it needs no config. Containers are never created.
-- A link with a `start` in the config: the command runs in a herdr tab named after the link, in the row's herdr workspace (the first one matching the row's `herdr` prefix, created if none matches). A tab with that name is reused when its shell is idle, and refused ("busy; it may still be starting") when it is not; otherwise a tab is created. WhatsUp types this one line into the tab's interactive shell, so aliases like `tt2a` work and the logs stay in the tab:
+- A link with a `start` in the config: the command runs in a herdr tab named after the link's column (`AssetCORE`), in the row's herdr workspace (the first one matching the row's `herdr` prefix, created if none matches). A tab with that name is reused when its shell is idle, and refused ("busy; it may still be starting") when it is not; otherwise a tab is created. Two start commands in one row need columns with different names. WhatsUp types this one line into the tab's interactive shell, so aliases like `tt2a` work and the logs stay in the tab:
   `cd -- '<dir>' && { <run>; }; echo "[whatsup <nonce>] exited with $?"`
 - When the command fails (a nonzero exit code) within 5 seconds, Start reports the code and the last lines of output instead of success. Exiting 0 within those 5 seconds counts as started ("<run> finished"); the ports then say whether the row came up. If herdr stops answering after the command was typed, Start still reports the port as started, with "could not watch it start".
 - A port with no `start` and no container publishing it fails with "no start command, and no container publishes it". Several containers publishing it fails with "several containers publish it: <names>".
@@ -167,7 +169,7 @@ whatsup stop  <row> [--machine <name>] [--json] [--port <port>]
 - `<row>` is a row `id` (case ignored) or `<group>/<index>` using the config index. `--machine` defaults to this machine.
 - Options go after the command. Before a command, `--port` is the port to listen on; after it, the port of the running WhatsUp.
 - `list` prints, for each machine, a summary line such as `megan 12/33 up  cpu 23%  ram 50%  disk 88% (warn)` (marked `(offline)` or `(WhatsUp not running there)` when so; see Machine load), then one line per row with its ports up or down and their labels. `--json` prints `{ machines, rows }`.
-- `start` and `stop` print one line per port (`3002  herdr   herdr tab jds2 portal in h2`). `stop` acts at once, with no confirmation.
+- `start` and `stop` print one line per port (`3002  herdr   herdr tab AssetCORE in h2`). `stop` acts at once, with no confirmation.
 - `start --wait` then polls until every port it started is up, or `--timeout` seconds (default 180) pass. `--json` prints the server's reply as is.
 - Exit codes: 0 success; 1 the action failed or timed out; 2 usage, unknown row, or WhatsUp not running.
 

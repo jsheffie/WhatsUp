@@ -43,6 +43,8 @@ pub struct Group {
     pub id: String,
     pub label: String,
     pub columns: Vec<String>,
+    /// Columns the dashboard hides until the viewer shows them.
+    pub hidden_columns: Vec<String>,
     pub rows: Vec<Row>,
 }
 
@@ -124,6 +126,9 @@ pub struct StartCommand {
     /// As written in the config; `~` is expanded at start time.
     pub dir: String,
     pub run: String,
+    /// The herdr tab it runs in: the link's column header, so each start
+    /// command of a row has a tab of its own whatever the links are labelled.
+    pub tab: String,
 }
 
 /// Expand a leading `~` in `dir` to `home`.
@@ -427,6 +432,8 @@ struct RawGroup {
     id: String,
     label: String,
     columns: Vec<String>,
+    #[serde(default)]
+    hidden_columns: Vec<String>,
     rows: Vec<RawRow>,
 }
 
@@ -517,21 +524,31 @@ impl RawGroup {
         if self.rows.is_empty() {
             return Err(format!("group {} has no rows", self.id));
         }
+        for column in &self.hidden_columns {
+            if !self.columns.contains(column) {
+                return Err(format!(
+                    "group {} hidden_columns names {column}, which is not one of its columns",
+                    self.id
+                ));
+            }
+        }
         let mut rows = Vec::with_capacity(self.rows.len());
         for (index, row) in self.rows.into_iter().enumerate() {
-            rows.push(row.into_row(&self.id, index, self.columns.len())?);
+            rows.push(row.into_row(&self.id, index, &self.columns)?);
         }
         Ok(Group {
             id: self.id,
             label: self.label,
             columns: self.columns,
+            hidden_columns: self.hidden_columns,
             rows,
         })
     }
 }
 
 impl RawRow {
-    fn into_row(self, group_id: &str, index: usize, column_count: usize) -> Result<Row, String> {
+    fn into_row(self, group_id: &str, index: usize, columns: &[String]) -> Result<Row, String> {
+        let column_count = columns.len();
         if self.cells.len() != column_count {
             return Err(format!(
                 "group {group_id} row {index} has {} cells, expected {column_count}",
@@ -575,15 +592,20 @@ impl RawRow {
         }
         let mut cells = Vec::with_capacity(self.cells.len());
         for (cell_index, value) in self.cells.into_iter().enumerate() {
-            cells.push(parse_cell(group_id, index, cell_index, value)?);
+            cells.push(parse_cell(
+                group_id,
+                index,
+                cell_index,
+                &columns[cell_index],
+                value,
+            )?);
         }
         let has_herdr = cells.iter().any(|cell| matches!(cell, Cell::Herdr(_)));
         let mut started_ports = BTreeSet::new();
+        let mut tabs = BTreeSet::new();
         for (cell_index, cell) in cells.iter().enumerate() {
             let Cell::Link(link) = cell else { continue };
-            if link.start.is_none() {
-                continue;
-            }
+            let Some(start) = &link.start else { continue };
             let at = format!("group {group_id} row {index} column {cell_index}");
             if !has_herdr {
                 return Err(format!(
@@ -596,6 +618,13 @@ impl RawRow {
                     link.port
                 ));
             }
+            // herdr finds a tab by its name, case ignored.
+            if !tabs.insert(start.tab.to_lowercase()) {
+                return Err(format!(
+                    "{at} start commands in one row need columns with different names (their herdr tabs); {} is used twice",
+                    start.tab
+                ));
+            }
         }
         Ok(Row {
             id: self.id,
@@ -606,7 +635,13 @@ impl RawRow {
     }
 }
 
-fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result<Cell, String> {
+fn parse_cell(
+    group_id: &str,
+    row: usize,
+    column: usize,
+    column_name: &str,
+    value: Value,
+) -> Result<Cell, String> {
     let at = format!("group {group_id} row {row} column {column}");
     match value {
         Value::Null => Ok(Cell::Empty),
@@ -646,7 +681,7 @@ fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result
             let host = host_from_url(&url)?;
             let start = match map.get("start") {
                 None | Some(Value::Null) => None,
-                Some(Value::Object(start)) => Some(parse_start(start, &at)?),
+                Some(Value::Object(start)) => Some(parse_start(start, column_name, &at)?),
                 Some(_) => return Err(format!("{at} start must be an object")),
             };
             Ok(Cell::Link(Link {
@@ -661,7 +696,11 @@ fn parse_cell(group_id: &str, row: usize, column: usize, value: Value) -> Result
     }
 }
 
-fn parse_start(map: &serde_json::Map<String, Value>, at: &str) -> Result<StartCommand, String> {
+fn parse_start(
+    map: &serde_json::Map<String, Value>,
+    column_name: &str,
+    at: &str,
+) -> Result<StartCommand, String> {
     for key in map.keys() {
         if !["dir", "run"].contains(&key.as_str()) {
             return Err(format!("{at} start has unknown field {key}"));
@@ -687,7 +726,16 @@ fn parse_start(map: &serde_json::Map<String, Value>, at: &str) -> Result<StartCo
     if run.trim_end().ends_with([';', '&', '|']) {
         return Err(format!("{at} start run must not end with ;, & or |"));
     }
-    Ok(StartCommand { dir, run })
+    if column_name.trim().is_empty() || column_name.chars().any(|ch| ch.is_control()) {
+        return Err(format!(
+            "{at} start needs a column name to name its herdr tab"
+        ));
+    }
+    Ok(StartCommand {
+        dir,
+        run,
+        tab: column_name.to_string(),
+    })
 }
 
 fn parse_herdr_cell(map: &serde_json::Map<String, Value>, at: &str) -> Result<Cell, String> {
@@ -1103,6 +1151,24 @@ mod tests {
         assert!(error.contains("does not match"), "{error}");
     }
 
+    #[test]
+    fn hidden_columns_default_empty_and_must_name_columns() {
+        let group = |hidden: &str| {
+            format!(
+                r#"{{ "groups": [{{ "id": "g", "label": "G", "columns": ["Name", "Swagger"]{hidden},
+                    "rows": [{{ "cells": ["x", null] }}] }}] }}"#
+            )
+        };
+        let config = parse_config(&group("")).unwrap();
+        assert!(config.groups[0].hidden_columns.is_empty());
+
+        let config = parse_config(&group(r#", "hidden_columns": ["Swagger"]"#)).unwrap();
+        assert_eq!(config.groups[0].hidden_columns, ["Swagger"]);
+
+        let error = parse_config(&group(r#", "hidden_columns": ["swagger"]"#)).unwrap_err();
+        assert!(error.contains("not one of its columns"), "{error}");
+    }
+
     fn fake_env(
         pairs: &'static [(&'static str, &'static str)],
     ) -> impl Fn(&str) -> Option<std::ffi::OsString> {
@@ -1185,11 +1251,33 @@ mod tests {
             Some(StartCommand {
                 dir: "~/workspace/huvr2".into(),
                 run: "tt2a && cd frontend && npm start".into(),
+                tab: "A".into(),
             })
         );
         assert_eq!(rows[1].id.as_deref(), Some("jds2"));
         assert_eq!(rows[1].herdr_prefix(), Some("h2"));
         assert_eq!(rows[0].herdr_prefix(), None);
+    }
+
+    #[test]
+    fn start_tabs_are_column_names_and_must_differ_in_a_row() {
+        let row = |columns: &str| {
+            format!(
+                r#"{{ "groups": [{{ "id": "g", "label": "G", "columns": {columns},
+                    "rows": [{{ "cells": [{HERDR},
+                      {{ "label": "jds3", "url": "http://localhost:3003"{START} }},
+                      {{ "label": "jds3", "url": "http://localhost:4003"{START} }}] }}] }}] }}"#
+            )
+        };
+        let config = parse_config(&row(r#"["W", "AssetCORE", "PipelineCORE"]"#)).unwrap();
+        let tabs: Vec<&str> = config
+            .links()
+            .map(|link| link.start.as_ref().unwrap().tab.as_str())
+            .collect();
+        assert_eq!(tabs, ["AssetCORE", "PipelineCORE"]);
+
+        let error = parse_config(&row(r#"["W", "Web", "web"]"#)).unwrap_err();
+        assert!(error.contains("different names"), "{error}");
     }
 
     #[test]

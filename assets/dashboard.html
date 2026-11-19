@@ -141,6 +141,73 @@
 
     button.quit:hover, button.text-button:hover { border-color: var(--muted); }
 
+    .columns-menu { position: relative; }
+
+    button.text-button[aria-expanded="true"] { border-color: var(--muted); }
+
+    .menu {
+      position: absolute;
+      top: calc(100% + 6px);
+      right: 0;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      width: max-content;
+      max-width: calc(100vw - 32px);
+      padding: 12px 14px;
+      background: var(--header);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+      font-size: 13px;
+    }
+
+    .menu[hidden] { display: none; }
+
+    .menu-groups {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 28px;
+    }
+
+    .menu fieldset {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+    }
+
+    .menu legend {
+      padding: 0 0 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .menu label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      white-space: nowrap;
+      cursor: pointer;
+    }
+
+    .menu button.reset {
+      align-self: flex-start;
+      padding: 0;
+      border: 0;
+      background: none;
+      color: var(--link);
+      font: inherit;
+      cursor: pointer;
+    }
+
+    .menu button.reset:hover { color: var(--link-hover); text-decoration: underline; }
+    .menu button.reset[hidden] { display: none; }
+
     nav.tabs {
       display: flex;
       gap: 22px;
@@ -181,6 +248,47 @@
     }
 
     .panel.first h2 { margin-top: 0; }
+    .panel.lead h2 { margin-top: 14px; }
+
+    /* Heads each machine's tables when several machines show; a click
+       folds them away. */
+    .machine-bar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      margin: 34px 0 0;
+      padding: 0 0 8px;
+      border: 0;
+      border-bottom: 1px solid var(--line);
+      background: none;
+      color: var(--text);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+    }
+
+    .machine-bar.first { margin-top: 0; }
+    .machine-bar[hidden] { display: none; }
+    .machine-bar .tag { font-size: 13px; padding: 2px 10px; }
+    .machine-bar .count { color: var(--muted); font-size: 13px; }
+    .machine-bar:hover .count { color: var(--text); }
+
+    .machine-bar .chevron {
+      width: 0;
+      height: 0;
+      border-left: 6px solid var(--muted);
+      border-top: 5px solid transparent;
+      border-bottom: 5px solid transparent;
+      transition: transform 0.15s ease;
+    }
+
+    .machine-bar[aria-expanded="true"] .chevron { transform: rotate(90deg); }
+    .machine-bar:hover .chevron { border-left-color: var(--text); }
+
+    @media (prefers-reduced-motion: reduce) {
+      .machine-bar .chevron { transition: none; }
+    }
     .panel h2.hidden { display: none; }
 
     .tag {
@@ -273,7 +381,8 @@
     }
 
     .service.up { cursor: pointer; color: var(--link); }
-    .service.up:hover .name { color: var(--link-hover); text-decoration: underline; }
+    .service.up:hover .name { color: var(--link-hover); }
+    .service.up:hover .addr { text-decoration: underline; }
     .service:disabled { cursor: default; color: var(--muted); }
 
     .dot {
@@ -295,13 +404,16 @@
       box-shadow: 0 0 0 3px rgba(154, 163, 173, 0.12);
     }
 
-    .copy { display: flex; flex-direction: column; min-width: 0; }
-    .name { font-weight: 550; }
-    .port {
-      color: var(--muted);
+    /* A link reads like an address: "jds3:3003". */
+    .addr {
       font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 12px;
+      font-size: 13px;
+      white-space: nowrap;
     }
+    .port { color: var(--muted); }
+
+    /* Columns the viewer has hidden (see the Columns menu). */
+    th.col-hidden, td.col-hidden { display: none; }
 
     /* The actions column hugs its buttons; the links keep the rest. */
     th.actions-col, td.actions-col {
@@ -313,31 +425,32 @@
     .row-actions {
       display: flex;
       justify-content: flex-end;
-      gap: 8px;
+      gap: 6px;
     }
 
     button.start, button.stop {
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      gap: 8px;
+      gap: 5px;
       /* Wide enough for "Starting..." and "Stopping...", so the label never
          resizes it. */
-      min-width: 128px;
-      height: 36px;
-      padding: 0 16px;
+      min-width: 100px;
+      height: 24px;
+      padding: 0 9px;
       border: 1px solid transparent;
       border-radius: 999px;
       color: #fff;
       font: inherit;
+      font-size: 12px;
       font-weight: 650;
       letter-spacing: 0.01em;
       cursor: pointer;
     }
 
     button.start .glyph, button.stop .glyph {
-      width: 10px;
-      height: 10px;
+      width: 7px;
+      height: 7px;
       flex: 0 0 auto;
       background: currentColor;
     }
@@ -407,6 +520,7 @@
       main { padding: 16px 16px 32px; }
       .title-row { flex-wrap: wrap; align-items: center; }
       .actions { padding-bottom: 0; }
+      .menu { left: 0; right: auto; }
       nav.tabs { overflow-x: auto; }
       nav.tabs button { flex: 0 0 auto; white-space: nowrap; }
     }
@@ -421,6 +535,10 @@
         <div class="load" id="load" role="group" aria-label="Machine load"></div>
       </div>
       <div class="actions">
+        <div class="columns-menu">
+          <button class="text-button" id="columns-button" type="button" aria-expanded="false" aria-controls="columns-panel">Columns</button>
+          <div class="menu" id="columns-panel" role="group" aria-label="Shown columns" hidden></div>
+        </div>
         <label class="toggle">
           <input id="up-only" type="checkbox">
           Up only
@@ -445,6 +563,8 @@
     const footerEl = document.getElementById("footer");
     const upOnlyEl = document.getElementById("up-only");
     const quitEl = document.getElementById("quit");
+    const columnsButtonEl = document.getElementById("columns-button");
+    const columnsPanelEl = document.getElementById("columns-panel");
 
     const requestedGroup = new URLSearchParams(location.search).get("group");
     let activeFilter = asFilter(requestedGroup || sessionStorage.getItem("whatsup-tab") || "");
@@ -482,6 +602,124 @@
       applyGroupVisibility();
     });
 
+    // Shown columns: the viewer's choices, by group id and column name, over
+    // the config's hidden_columns. Keyed by group id, so a group shown for
+    // several machines hides the same columns on each.
+    const COLUMNS_KEY = "whatsup-columns";
+    let columnChoices = readColumnChoices();
+    let menuGroups = []; // [{ id, label, columns, hidden_columns }]
+    let lastMenuKey = "";
+
+    function readColumnChoices() {
+      try {
+        const value = JSON.parse(localStorage.getItem(COLUMNS_KEY) || "{}");
+        return value && typeof value === "object" ? value : {};
+      } catch (err) {
+        return {};
+      }
+    }
+
+    function saveColumnChoices() {
+      try {
+        localStorage.setItem(COLUMNS_KEY, JSON.stringify(columnChoices));
+      } catch (err) {
+        // Not remembered; the choice still applies until the page reloads.
+      }
+    }
+
+    function columnShown(group, column) {
+      const choice = (columnChoices[group.id] || {})[column];
+      return typeof choice === "boolean" ? choice : !(group.hidden_columns || []).includes(column);
+    }
+
+    function applyColumns() {
+      tablesEl.querySelectorAll(":scope > .panel").forEach((panel) => {
+        const group = menuGroups.find((known) => known.id === panel.dataset.group);
+        if (!group) return;
+        const hidden = group.columns.map((column) => !columnShown(group, column));
+        panel.querySelectorAll("tr").forEach((tr) => {
+          [...tr.children].forEach((cell, index) => {
+            cell.classList.toggle("col-hidden", Boolean(hidden[index]));
+          });
+        });
+      });
+    }
+
+    function paintColumnsMenu() {
+      const groupsEl = document.createElement("div");
+      groupsEl.className = "menu-groups";
+      menuGroups.forEach((group) => {
+        const fieldset = document.createElement("fieldset");
+        const legend = document.createElement("legend");
+        legend.textContent = group.label;
+        fieldset.appendChild(legend);
+        group.columns.forEach((column) => {
+          const label = document.createElement("label");
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.checked = columnShown(group, column);
+          box.addEventListener("change", () => {
+            const choices = columnChoices[group.id] || (columnChoices[group.id] = {});
+            const byDefault = !(group.hidden_columns || []).includes(column);
+            if (box.checked === byDefault) delete choices[column];
+            else choices[column] = box.checked;
+            if (!Object.keys(choices).length) delete columnChoices[group.id];
+            saveColumnChoices();
+            applyColumns();
+            resetEl.hidden = !Object.keys(columnChoices).length;
+          });
+          label.append(box, column);
+          fieldset.appendChild(label);
+        });
+        groupsEl.appendChild(fieldset);
+      });
+      const resetEl = document.createElement("button");
+      resetEl.type = "button";
+      resetEl.className = "reset";
+      resetEl.textContent = "Reset to defaults";
+      resetEl.hidden = !Object.keys(columnChoices).length;
+      resetEl.addEventListener("click", () => {
+        columnChoices = {};
+        saveColumnChoices();
+        paintColumnsMenu();
+        applyColumns();
+        columnsButtonEl.focus();
+      });
+      columnsPanelEl.replaceChildren(groupsEl, resetEl);
+    }
+
+    // Each group once (a group shows once per machine), in config order.
+    function setMenuGroups(groups) {
+      const unique = [];
+      groups.forEach((group) => {
+        if (!unique.some((known) => known.id === group.id)) unique.push(group);
+      });
+      menuGroups = unique.map(({ id, label, columns, hidden_columns }) => ({ id, label, columns, hidden_columns }));
+      // Rebuilt only when the groups change, so an open menu keeps its focus.
+      const key = JSON.stringify(menuGroups);
+      if (key === lastMenuKey) return;
+      lastMenuKey = key;
+      paintColumnsMenu();
+    }
+
+    function setColumnsMenuOpen(open) {
+      columnsPanelEl.hidden = !open;
+      columnsButtonEl.setAttribute("aria-expanded", open ? "true" : "false");
+    }
+
+    columnsButtonEl.addEventListener("click", () => setColumnsMenuOpen(columnsPanelEl.hidden));
+
+    document.addEventListener("click", (event) => {
+      if (!columnsPanelEl.hidden && !event.target.closest(".columns-menu")) setColumnsMenuOpen(false);
+    });
+
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && !columnsPanelEl.hidden) {
+        setColumnsMenuOpen(false);
+        columnsButtonEl.focus();
+      }
+    });
+
     quitEl.addEventListener("click", async () => {
       quitEl.disabled = true;
       clearTimeout(timer);
@@ -514,19 +752,86 @@
       document.querySelectorAll("#tabs button").forEach((button) => {
         button.setAttribute("aria-selected", button.dataset.filter === activeFilter ? "true" : "false");
       });
+      // Machine bars show wherever several machines can: not on a machine's
+      // own tab.
+      const barsOn = multiMachine && !activeFilter.startsWith("machine:");
+      const panels = [...tablesEl.querySelectorAll(":scope > .panel")];
       let first = true;
-      document.querySelectorAll("#tables > .panel").forEach((panel) => {
-        // "Up only" can hide every row of a table; a bare header row says
-        // nothing, so the whole section goes.
-        const rows = [...panel.querySelectorAll("tbody tr")];
-        const empty = rows.length > 0 && rows.every((row) => row.classList.contains("hidden"));
-        panel.hidden = !shows(panel) || empty;
-        panel.classList.toggle("first", !panel.hidden && first);
-        if (!panel.hidden) first = false;
+      let lead = false;
+      [...tablesEl.children].forEach((el) => {
+        const name = el.dataset.machine;
+        if (el.classList.contains("machine-bar")) {
+          const open = !folded.has(name);
+          el.hidden = !barsOn || !panels.some((panel) => panel.dataset.machine === name && wouldShow(panel));
+          el.setAttribute("aria-expanded", open ? "true" : "false");
+          el.querySelector(".count").textContent = el.dataset.count + (open ? "" : " · folded");
+          el.classList.toggle("first", !el.hidden && first);
+          if (!el.hidden) {
+            first = false;
+            lead = true;
+          }
+          return;
+        }
+        el.hidden = !wouldShow(el) || (barsOn && folded.has(name));
+        el.classList.toggle("first", !el.hidden && first);
+        el.classList.toggle("lead", !el.hidden && lead);
+        if (!el.hidden) first = lead = false;
         // With one machine a group tab shows just its table, as it always has.
-        const heading = panel.querySelector("h2");
+        const heading = el.querySelector("h2");
         heading.classList.toggle("hidden", !multiMachine && activeFilter.startsWith("group:"));
       });
+    }
+
+    // A panel the tab and "Up only" leave showing. "Up only" can hide every
+    // row of a table; a bare header row says nothing, so the whole section
+    // goes.
+    function wouldShow(panel) {
+      const rows = [...panel.querySelectorAll("tbody tr")];
+      const empty = rows.length > 0 && rows.every((row) => row.classList.contains("hidden"));
+      return shows(panel) && !empty;
+    }
+
+    // Machines whose tables are folded away, by name.
+    const FOLDED_KEY = "whatsup-folded";
+    const folded = new Set(readFolded());
+
+    function readFolded() {
+      try {
+        const value = JSON.parse(localStorage.getItem(FOLDED_KEY) || "[]");
+        return Array.isArray(value) ? value : [];
+      } catch (err) {
+        return [];
+      }
+    }
+
+    function machineBar(machine) {
+      const bar = document.createElement("button");
+      bar.type = "button";
+      bar.className = "machine-bar";
+      bar.dataset.machine = machine.name;
+      bar.dataset.count = machine.offline
+        ? "offline"
+        : machine.ports_up + " of " + machine.ports_total + " ports up";
+      const chevron = document.createElement("span");
+      chevron.className = "chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      const tag = document.createElement("span");
+      tag.className = "tag" + (machine.local ? "" : " remote");
+      tag.textContent = machine.name;
+      const count = document.createElement("span");
+      count.className = "count";
+      bar.append(chevron, tag, count);
+      bar.addEventListener("click", () => {
+        if (folded.has(machine.name)) folded.delete(machine.name);
+        else folded.add(machine.name);
+        try {
+          localStorage.setItem(FOLDED_KEY, JSON.stringify([...folded]));
+        } catch (err) {
+          // Not remembered; the fold still applies until the page reloads.
+        }
+        applyGroupVisibility();
+      });
+      return bar;
     }
 
     function applyUpOnly(row) {
@@ -755,9 +1060,15 @@
       }
       groups.forEach((group) => tabsEl.appendChild(tabButton("group:" + group.id, group.label)));
 
+      setMenuGroups(data.groups);
       tablesEl.replaceChildren();
+      const barred = new Set();
       data.groups.forEach((group) => {
         const machine = byName[group.machine] || machines[0];
+        if (multiMachine && !barred.has(machine.name)) {
+          barred.add(machine.name);
+          tablesEl.appendChild(machineBar(machine));
+        }
         const panel = document.createElement("div");
         panel.className = "panel";
         panel.dataset.group = group.id;
@@ -784,6 +1095,7 @@
         panel.append(heading, scroller);
         tablesEl.appendChild(panel);
       });
+      applyColumns();
       applyGroupVisibility();
 
       footerEl.replaceChildren();
@@ -871,16 +1183,16 @@
       dot.className = "dot";
       dot.setAttribute("aria-hidden", "true");
 
-      const copy = document.createElement("span");
-      copy.className = "copy";
+      const addr = document.createElement("span");
+      addr.className = "addr";
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = cell.label;
       const port = document.createElement("span");
       port.className = "port";
-      port.textContent = String(cell.port);
-      copy.append(name, port);
-      button.append(dot, copy);
+      port.textContent = ":" + cell.port;
+      addr.append(name, port);
+      button.append(dot, addr);
       if (cell.up) {
         button.addEventListener("click", () => openLink(button, cell.url, machine.name));
       }
