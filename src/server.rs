@@ -574,9 +574,9 @@ fn plan_start(row: &Row, up: impl Fn(&str, u16) -> bool) -> (Vec<PortStart>, Vec
             .iter()
             .find_map(|link| Some((link, link.start.as_ref()?)));
         let kind = match (command, row.herdr_prefix()) {
-            (Some((link, start)), Some(prefix)) => StartKind::Herdr {
+            (Some((_, start)), Some(prefix)) => StartKind::Herdr {
                 prefix: prefix.to_string(),
-                label: link.label.clone(),
+                label: start.tab.clone(),
                 dir: PathBuf::from(&start.dir),
                 run: start.run.clone(),
             },
@@ -879,6 +879,7 @@ fn group_view(group: &Group, machine: &MachineStatus) -> Value {
         "machine": machine.name,
         "label": group.label,
         "columns": group.columns,
+        "hidden_columns": group.hidden_columns,
         "rows": group.rows.iter().enumerate().filter(|(_, row)| row.shown_on(&machine.name)).map(|(index, row)| {
             json!({
                 // The row's place in the config, which /api/start and /api/stop
@@ -2089,14 +2090,14 @@ mod tests {
                 3002,
                 herdr(
                     "h2",
-                    "portal",
+                    "Portal",
                     "~/workspace/huvr2",
                     "tt2a && cd frontend && npm start",
                 ),
             ),
             entry(
                 4002,
-                herdr("h2", "tt-calc-app", "~/workspace/tt-calc-app2", "ttc2a"),
+                herdr("h2", "Calc", "~/workspace/tt-calc-app2", "ttc2a"),
             ),
             entry(8002, StartKind::Docker),
         ]
@@ -2414,7 +2415,7 @@ mod tests {
             lucy_starter.plans(),
             [vec![entry(
                 3007,
-                herdr("h7", "portal7", "~/workspace/huvr7", "tt7a")
+                herdr("h7", "Portal", "~/workspace/huvr7", "tt7a")
             )]]
         );
         assert!(megan_starter.plans().is_empty());
